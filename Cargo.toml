@@ -1,0 +1,24 @@
+[package]
+name = "test_md3_standalone"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "test_md3_standalone"
+path = "src/lib.rs"
+
+[[bin]]
+name = "test_md3_standalone"
+path = "src/main.rs"
+
+[[bin]]
+name = "game_mvp"
+path = "src/bin/game_mvp.rs"
+
+[dependencies]
+wgpu = "0.20"
+winit = "0.30"
+bytemuck = { version = "1.14", features = ["derive"] }
+glam = "0.24"
+pollster = "0.3"
+image = "0.24"
