@@ -13,10 +13,67 @@ use winit::{
 };
 
 use test_md3_standalone::anim::AnimConfig;
-use test_md3_standalone::loader::load_textures_for_model_static;
+use test_md3_standalone::loader::{load_textures_for_model_static, load_weapon_textures_static};
 use test_md3_standalone::math::{axis_from_mat3, attach_rotated_entity, orientation_to_mat4, Orientation};
 use test_md3_standalone::md3::MD3Model;
 use test_md3_standalone::renderer::{MD3Renderer, WgpuRenderer};
+
+extern crate rand;
+
+struct Light {
+    position: Vec3,
+    color: Vec3,
+    radius: f32,
+}
+
+impl Light {
+    fn new(position: Vec3, color: Vec3, radius: f32) -> Self {
+        Self {
+            position,
+            color,
+            radius,
+        }
+    }
+}
+
+struct LightingParams {
+    lights: Vec<Light>,
+    ambient: f32,
+}
+
+impl LightingParams {
+    fn new() -> Self {
+        Self {
+            lights: vec![
+                Light::new(Vec3::new(3.0, 1., 2.0), Vec3::new(2.5, 2.5, 2.5), 20.0),
+                Light::new(Vec3::new(1.0, 1.10, 2.0), Vec3::new(0.6, 0.6, 1.0), 1.0),
+            ],
+            ambient: 0.00015,
+        }
+    }
+}
+
+struct Camera {
+    distance: f32,
+    height: f32,
+}
+
+impl Camera {
+    fn new() -> Self {
+        Self {
+            distance: 20.0,
+            height: 2.0,
+        }
+    }
+
+    fn get_view_proj(&self, aspect: f32, player_x: f32) -> (Mat4, Vec3) {
+        let camera_pos = Vec3::new(player_x, self.height, self.distance);
+        let camera_target = Vec3::new(player_x, self.height * 0.5, 0.0);
+        let view_matrix = Mat4::look_at_rh(camera_pos, camera_target, Vec3::Y);
+        let proj_matrix = Mat4::perspective_rh(std::f32::consts::PI / 4.0, aspect, 0.1, 1000.0);
+        (proj_matrix * view_matrix, camera_pos)
+    }
+}
 
 struct Player {
     x: f32,
@@ -38,9 +95,9 @@ impl Player {
     }
 
     fn update(&mut self, dt: f32, move_left: bool, move_right: bool) {
-        let accel = 800.0;
-        let friction = 12.0;
-        let max_speed = 200.0;
+        let accel = 100.0;
+        let friction = 10.0;
+        let max_speed = 15.0;
 
         if move_left && !move_right {
             self.vx -= accel * dt;
@@ -57,7 +114,7 @@ impl Player {
         self.vx -= self.vx * friction * dt;
         self.vx = self.vx.clamp(-max_speed, max_speed);
 
-        if self.vx.abs() < 1.0 {
+        if self.vx.abs() < 0.01 {
             self.vx = 0.0;
         }
 
@@ -69,6 +126,76 @@ impl Player {
     }
 }
 
+struct Rocket {
+    position: Vec3,
+    velocity: Vec3,
+    lifetime: f32,
+    active: bool,
+}
+
+impl Rocket {
+    fn new(position: Vec3, direction: Vec3, speed: f32) -> Self {
+        Self {
+            position,
+            velocity: direction.normalize() * speed,
+            lifetime: 0.0,
+            active: true,
+        }
+    }
+
+    fn update(&mut self, dt: f32) {
+        if !self.active {
+            return;
+        }
+
+        self.position += self.velocity * dt;
+        self.lifetime += dt;
+
+        if self.lifetime > 10.0 {
+            self.active = false;
+        }
+    }
+}
+
+struct SmokeParticle {
+    position: Vec3,
+    velocity: Vec3,
+    lifetime: f32,
+    max_lifetime: f32,
+    size: f32,
+}
+
+impl SmokeParticle {
+    fn new(position: Vec3) -> Self {
+        let random_offset = Vec3::new(
+            (rand::random::<f32>() - 0.5) * 0.5,
+            (rand::random::<f32>() - 0.5) * 0.5,
+            (rand::random::<f32>() - 0.5) * 0.5,
+        );
+        Self {
+            position,
+            velocity: random_offset,
+            lifetime: 0.0,
+            max_lifetime: 2.5,
+            size: 1.2,
+        }
+    }
+
+    fn update(&mut self, dt: f32) {
+        self.position += self.velocity * dt;
+        self.lifetime += dt;
+        self.size += dt * 1.2;
+    }
+
+    fn is_alive(&self) -> bool {
+        self.lifetime < self.max_lifetime
+    }
+
+    fn alpha(&self) -> f32 {
+        (1.0 - self.lifetime / self.max_lifetime).max(0.0) * 0.7
+    }
+}
+
 struct GameApp {
     window: Option<Arc<Window>>,
     wgpu_renderer: Option<WgpuRenderer>,
@@ -76,10 +203,21 @@ struct GameApp {
     player_lower: Option<MD3Model>,
     player_upper: Option<MD3Model>,
     player_head: Option<MD3Model>,
+    weapon: Option<MD3Model>,
+    player2_lower: Option<MD3Model>,
+    player2_upper: Option<MD3Model>,
+    player2_head: Option<MD3Model>,
+    rocket_model: Option<MD3Model>,
     anim_config: Option<AnimConfig>,
+    player2_anim_config: Option<AnimConfig>,
     lower_textures: Vec<Option<String>>,
     upper_textures: Vec<Option<String>>,
     head_textures: Vec<Option<String>>,
+    weapon_textures: Vec<Option<String>>,
+    player2_lower_textures: Vec<Option<String>>,
+    player2_upper_textures: Vec<Option<String>>,
+    player2_head_textures: Vec<Option<String>>,
+    rocket_textures: Vec<Option<String>>,
     depth_texture: Option<Texture>,
     depth_view: Option<wgpu::TextureView>,
     start_time: Instant,
@@ -90,11 +228,16 @@ struct GameApp {
     player: Player,
     move_left: bool,
     move_right: bool,
-    camera_height: f32,
+    shoot_pressed: bool,
+    rockets: Vec<Rocket>,
+    smoke_particles: Vec<SmokeParticle>,
+    last_smoke_spawn: f32,
+    last_debug_log: f32,
 }
 
 impl GameApp {
     fn new() -> Self {
+        let now = Instant::now();
         Self {
             window: None,
             wgpu_renderer: None,
@@ -102,21 +245,36 @@ impl GameApp {
             player_lower: None,
             player_upper: None,
             player_head: None,
+            weapon: None,
+            player2_lower: None,
+            player2_upper: None,
+            player2_head: None,
+            rocket_model: None,
             anim_config: None,
+            player2_anim_config: None,
             lower_textures: Vec::new(),
             upper_textures: Vec::new(),
             head_textures: Vec::new(),
+            weapon_textures: Vec::new(),
+            player2_lower_textures: Vec::new(),
+            player2_upper_textures: Vec::new(),
+            player2_head_textures: Vec::new(),
+            rocket_textures: Vec::new(),
             depth_texture: None,
             depth_view: None,
-            start_time: Instant::now(),
-            last_frame_time: Instant::now(),
-            last_fps_update: Instant::now(),
+            start_time: now,
+            last_frame_time: now,
+            last_fps_update: now,
             frame_count: 0,
             fps: 0.0,
             player: Player::new(),
             move_left: false,
             move_right: false,
-            camera_height: 1.5,
+            shoot_pressed: false,
+            rockets: Vec::new(),
+            smoke_particles: Vec::new(),
+            last_smoke_spawn: 0.0,
+            last_debug_log: 0.0,
         }
     }
 
@@ -135,7 +293,7 @@ impl GameApp {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Depth32Float,
+                    format: wgpu::TextureFormat::Depth24PlusStencil8,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 });
@@ -143,6 +301,82 @@ impl GameApp {
             self.depth_texture = Some(depth_texture);
             self.depth_view = Some(depth_view);
         }
+    }
+
+    fn load_model_part(paths: &[&str]) -> Option<MD3Model> {
+        paths
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .and_then(|path| {
+                println!("Loading model: {}", path);
+                MD3Model::load(path).ok()
+            })
+    }
+
+    fn update_fps_counter(&mut self, now: Instant) {
+        self.frame_count += 1;
+        let fps_elapsed = now.duration_since(self.last_fps_update).as_secs_f32();
+        if fps_elapsed >= 0.5 {
+            self.fps = self.frame_count as f32 / fps_elapsed;
+            self.frame_count = 0;
+            self.last_fps_update = now;
+            if let Some(ref window) = self.window {
+                window.set_title(&format!(
+                    "SAS2 MVP | FPS: {:.0} | X: {:.1}",
+                    self.fps, self.player.x
+                ));
+            }
+        }
+    }
+
+    fn calculate_animation_frame(&self, is_moving: bool, animation_time: f32, model: &MD3Model) -> usize {
+        if let Some(ref config) = self.anim_config {
+            let anim = if is_moving {
+                &config.legs_run
+            } else {
+                &config.legs_idle
+            };
+            let frame_in_anim = if anim.looping_frames > 0 {
+                ((animation_time * anim.fps as f32) as usize) % anim.looping_frames
+            } else {
+                0
+            };
+            let frame = anim.first_frame + frame_in_anim;
+            frame.min(model.header.num_bone_frames as usize - 1)
+        } else {
+            0
+        }
+    }
+
+    fn calculate_torso_frame(&self, model: &MD3Model) -> usize {
+        if let Some(ref config) = self.anim_config {
+            let anim = &config.torso_stand;
+            let frame_in_anim = if anim.looping_frames > 0 {
+                ((self.start_time.elapsed().as_secs_f32() * anim.fps as f32) as usize)
+                    % anim.looping_frames
+            } else {
+                0
+            };
+            let frame = anim.first_frame + frame_in_anim;
+            frame.min(model.header.num_bone_frames as usize - 1)
+        } else {
+            0
+        }
+    }
+
+    fn shoot_rocket(&mut self) {
+        let muzzle_offset = if self.player.facing_right {
+            Vec3::new(1.0, 0.0, 0.0)
+        } else {
+            Vec3::new(-1.0, 0.0, 0.0)
+        };
+        let rocket_position = Vec3::new(self.player.x, 0.5, 0.0) + muzzle_offset;
+        let direction = if self.player.facing_right {
+            Vec3::new(1.0, 0.0, 0.0)
+        } else {
+            Vec3::new(-1.0, 0.0, 0.0)
+        };
+        self.rockets.push(Rocket::new(rocket_position, direction, 35.0));
     }
 }
 
@@ -161,37 +395,43 @@ impl ApplicationHandler for GameApp {
         let mut md3_renderer =
             MD3Renderer::new(wgpu_renderer.device.clone(), wgpu_renderer.queue.clone());
 
-        let model_paths = [
-            ("lower", vec![
-                "q3-resources/models/players/sarge/lower.md3",
-                "../q3-resources/models/players/sarge/lower.md3",
-            ]),
-            ("upper", vec![
-                "q3-resources/models/players/sarge/upper.md3",
-                "../q3-resources/models/players/sarge/upper.md3",
-            ]),
-            ("head", vec![
-                "q3-resources/models/players/sarge/head.md3",
-                "../q3-resources/models/players/sarge/head.md3",
-            ]),
-        ];
+        self.player_lower = Self::load_model_part(&[
+            "q3-resources/models/players/sarge/lower.md3",
+            "../q3-resources/models/players/sarge/lower.md3",
+        ]);
+        self.player_upper = Self::load_model_part(&[
+            "q3-resources/models/players/sarge/upper.md3",
+            "../q3-resources/models/players/sarge/upper.md3",
+        ]);
+        self.player_head = Self::load_model_part(&[
+            "q3-resources/models/players/sarge/head.md3",
+            "../q3-resources/models/players/sarge/head.md3",
+        ]);
+        self.weapon = Self::load_model_part(&[
+            "q3-resources/models/weapons2/rocketl/rocketl.md3",
+            "../q3-resources/models/weapons2/rocketl/rocketl.md3",
+        ]);
 
-        for (part, paths) in &model_paths {
-            let path = paths.iter().find(|p| std::path::Path::new(p).exists());
-            if let Some(path) = path {
-                println!("Loading {}: {}", part, path);
-                if let Ok(model) = MD3Model::load(path) {
-                    match *part {
-                        "lower" => self.player_lower = Some(model),
-                        "upper" => self.player_upper = Some(model),
-                        "head" => self.player_head = Some(model),
-                        _ => {}
-                    }
-                }
-            }
-        }
+        self.player2_lower = Self::load_model_part(&[
+            "q3-resources/models/players/orbb/lower.md3",
+            "../q3-resources/models/players/orbb/lower.md3",
+        ]);
+        self.player2_upper = Self::load_model_part(&[
+            "q3-resources/models/players/orbb/upper.md3",
+            "../q3-resources/models/players/orbb/upper.md3",
+        ]);
+        self.player2_head = Self::load_model_part(&[
+            "q3-resources/models/players/orbb/head.md3",
+            "../q3-resources/models/players/orbb/head.md3",
+        ]);
+
+        self.rocket_model = Self::load_model_part(&[
+            "q3-resources/models/ammo/rocket/rocket.md3",
+            "../q3-resources/models/ammo/rocket/rocket.md3",
+        ]);
 
         self.anim_config = AnimConfig::load("sarge").ok();
+        self.player2_anim_config = AnimConfig::load("orbb").ok();
 
         let surface_format = wgpu_renderer.surface_config.format;
         md3_renderer.create_pipeline(surface_format);
@@ -207,6 +447,103 @@ impl ApplicationHandler for GameApp {
         if let Some(ref head) = self.player_head {
             self.head_textures =
                 load_textures_for_model_static(&mut wgpu_renderer, &mut md3_renderer, head, "sarge", "head");
+        }
+        if let Some(ref weapon) = self.weapon {
+            self.weapon_textures =
+                load_weapon_textures_static(&mut wgpu_renderer, &mut md3_renderer, weapon);
+        }
+
+        if let Some(ref lower) = self.player2_lower {
+            self.player2_lower_textures =
+                load_textures_for_model_static(&mut wgpu_renderer, &mut md3_renderer, lower, "orbb", "lower");
+        }
+        if let Some(ref upper) = self.player2_upper {
+            self.player2_upper_textures =
+                load_textures_for_model_static(&mut wgpu_renderer, &mut md3_renderer, upper, "orbb", "upper");
+        }
+        if let Some(ref head) = self.player2_head {
+            self.player2_head_textures =
+                load_textures_for_model_static(&mut wgpu_renderer, &mut md3_renderer, head, "orbb", "head");
+        }
+
+        if let Some(ref rocket) = self.rocket_model {
+            for mesh in &rocket.meshes {
+                let shader_name = std::str::from_utf8(&mesh.header.name)
+                    .unwrap_or("")
+                    .trim_end_matches('\0');
+                
+                let texture_paths = vec![
+                    format!("../q3-resources/models/ammo/rocket/{}.png", shader_name),
+                    format!("../q3-resources/models/ammo/rocket/{}.jpg", shader_name),
+                ];
+                
+                let mut texture_loaded = false;
+                for texture_path in texture_paths {
+                    if std::path::Path::new(&texture_path).exists() {
+                        if let Ok(data) = std::fs::read(&texture_path) {
+                            if let Ok(img) = image::load_from_memory(&data) {
+                                let img = img.to_rgba8();
+                                let size = wgpu::Extent3d {
+                                    width: img.width(),
+                                    height: img.height(),
+                                    depth_or_array_layers: 1,
+                                };
+                                let texture = wgpu_renderer.device.create_texture(&wgpu::TextureDescriptor {
+                                    label: Some("Rocket Texture"),
+                                    size,
+                                    mip_level_count: 1,
+                                    sample_count: 1,
+                                    dimension: wgpu::TextureDimension::D2,
+                                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                                    view_formats: &[],
+                                });
+
+                                wgpu_renderer.queue.write_texture(
+                                    wgpu::ImageCopyTexture {
+                                        texture: &texture,
+                                        mip_level: 0,
+                                        origin: wgpu::Origin3d::ZERO,
+                                        aspect: wgpu::TextureAspect::All,
+                                    },
+                                    &img,
+                                    wgpu::ImageDataLayout {
+                                        offset: 0,
+                                        bytes_per_row: Some(4 * img.width()),
+                                        rows_per_image: Some(img.height()),
+                                    },
+                                    size,
+                                );
+
+                                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                                let sampler = wgpu_renderer.device.create_sampler(&wgpu::SamplerDescriptor {
+                                    address_mode_u: wgpu::AddressMode::Repeat,
+                                    address_mode_v: wgpu::AddressMode::Repeat,
+                                    address_mode_w: wgpu::AddressMode::Repeat,
+                                    mag_filter: wgpu::FilterMode::Linear,
+                                    min_filter: wgpu::FilterMode::Linear,
+                                    mipmap_filter: wgpu::FilterMode::Linear,
+                                    ..Default::default()
+                                });
+
+                                let wgpu_tex = test_md3_standalone::renderer::WgpuTexture {
+                                    texture,
+                                    view,
+                                    sampler,
+                                };
+
+                                md3_renderer.load_texture(&texture_path, wgpu_tex);
+                                self.rocket_textures.push(Some(texture_path));
+                                texture_loaded = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !texture_loaded {
+                    self.rocket_textures.push(None);
+                }
+            }
         }
 
         self.window = Some(window.clone());
@@ -240,6 +577,12 @@ impl ApplicationHandler for GameApp {
                     match code {
                         KeyCode::KeyA | KeyCode::ArrowLeft => self.move_left = pressed,
                         KeyCode::KeyD | KeyCode::ArrowRight => self.move_right = pressed,
+                        KeyCode::Space => {
+                            if pressed && !self.shoot_pressed {
+                                self.shoot_rocket();
+                            }
+                            self.shoot_pressed = pressed;
+                        }
                         KeyCode::Escape if pressed => event_loop.exit(),
                         _ => {}
                     }
@@ -250,21 +593,36 @@ impl ApplicationHandler for GameApp {
                 let dt = now.duration_since(self.last_frame_time).as_secs_f32();
                 self.last_frame_time = now;
 
-                self.frame_count += 1;
-                let fps_elapsed = now.duration_since(self.last_fps_update).as_secs_f32();
-                if fps_elapsed >= 0.5 {
-                    self.fps = self.frame_count as f32 / fps_elapsed;
-                    self.frame_count = 0;
-                    self.last_fps_update = now;
-                    if let Some(ref window) = self.window {
-                        window.set_title(&format!(
-                            "SAS2 MVP | FPS: {:.0} | X: {:.0}",
-                            self.fps, self.player.x
-                        ));
+                self.update_fps_counter(now);
+                self.player.update(dt, self.move_left, self.move_right);
+
+                for rocket in &mut self.rockets {
+                    rocket.update(dt);
+                }
+                self.rockets.retain(|r| r.active);
+
+                self.last_smoke_spawn += dt;
+                if self.last_smoke_spawn > 0.015 {
+                    for rocket in &self.rockets {
+                        for _ in 0..3 {
+                            self.smoke_particles.push(SmokeParticle::new(rocket.position));
+                        }
                     }
+                    self.last_smoke_spawn = 0.0;
                 }
 
-                self.player.update(dt, self.move_left, self.move_right);
+                for particle in &mut self.smoke_particles {
+                    particle.update(dt);
+                }
+                self.smoke_particles.retain(|p| p.is_alive());
+
+                let lower_frame = self.player_lower.as_ref()
+                    .map(|lower| self.calculate_animation_frame(self.player.is_moving, self.player.animation_time, lower))
+                    .unwrap_or(0);
+
+                let upper_frame = self.player_upper.as_ref()
+                    .map(|upper| self.calculate_torso_frame(upper))
+                    .unwrap_or(0);
 
                 let (wgpu_renderer, md3_renderer) =
                     match (self.wgpu_renderer.as_mut(), self.md3_renderer.as_mut()) {
@@ -324,27 +682,19 @@ impl ApplicationHandler for GameApp {
                 let (width, height) = wgpu_renderer.get_viewport_size();
                 let aspect = width as f32 / height as f32;
 
-                let camera_distance = 80.0;
-                let camera_x = self.player.x * 0.05;
-                let camera_target = Vec3::new(camera_x, self.camera_height, 0.0);
-                let camera_pos = Vec3::new(camera_x, self.camera_height, camera_distance);
+                let camera = Camera::new();
+                let (view_proj, camera_pos) = camera.get_view_proj(aspect);
 
-                let view_matrix = Mat4::look_at_rh(camera_pos, camera_target, Vec3::Y);
-                let proj_matrix =
-                    Mat4::perspective_rh(std::f32::consts::PI / 4.0, aspect, 0.1, 1000.0);
-                let view_proj = proj_matrix * view_matrix;
-
-                let player_world_x = self.player.x * 0.05;
-                let player_world_y = 0.0;
-
-                let light_pos0 = Vec3::new(player_world_x + 2.0, 3.0, 4.0);
-                let light_color0 = Vec3::new(2.5, 2.3, 2.1);
-                let light_radius0 = 15.0;
-                let light_pos1 = Vec3::new(player_world_x - 2.0, 1.0, 3.0);
-                let light_color1 = Vec3::new(0.8, 0.8, 1.2);
-                let light_radius1 = 10.0;
-                let ambient = 0.2;
-                let num_lights = 2;
+                let mut lighting = LightingParams::new();
+                
+                for rocket in &self.rockets {
+                    let flame_color = Vec3::new(3.5, 2.0, 0.8);
+                    lighting.lights.push(Light::new(rocket.position, flame_color, 12.0));
+                }
+                
+                let lights: Vec<(Vec3, Vec3, f32)> = lighting.lights.iter()
+                    .map(|l| (l.position, l.color, l.radius))
+                    .collect();
 
                 md3_renderer.render_ground(
                     &mut encoder,
@@ -352,72 +702,44 @@ impl ApplicationHandler for GameApp {
                     depth_view,
                     view_proj,
                     camera_pos,
-                    light_pos0,
-                    light_color0,
-                    light_radius0,
-                    light_pos1,
-                    light_color1,
-                    light_radius1,
-                    num_lights,
-                    ambient,
+                    &lights,
+                    lighting.ambient,
                 );
 
-                let correction = Mat3::from_rotation_x(-std::f32::consts::PI / 2.0);
+                md3_renderer.render_wall(
+                    &mut encoder,
+                    &view,
+                    depth_view,
+                    view_proj,
+                    camera_pos,
+                    &lights,
+                    lighting.ambient,
+                );
+
+                let correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
                 let facing_angle = if self.player.facing_right {
-                    -std::f32::consts::FRAC_PI_2
+                    0.0
                 } else {
-                    std::f32::consts::FRAC_PI_2
+                    std::f32::consts::PI
                 };
                 let rotation = Mat3::from_rotation_y(facing_angle) * correction;
                 let lower_axis = axis_from_mat3(rotation);
-                let lower_origin = Vec3::new(player_world_x, player_world_y, 0.0);
+                let lower_origin = Vec3::new(self.player.x, -13.5, 0.0);
                 let lower_orientation = Orientation {
                     origin: lower_origin,
                     axis: lower_axis,
                 };
+                
+                println!("🎮 Sarge X: {:.2} | Orbb X: 25.0", self.player.x);
 
-                let scale = 0.05;
+                let scale = 0.04;
                 let scale_mat = Mat4::from_scale(Vec3::splat(scale));
-
-                let lower_frame = if let (Some(ref config), Some(ref lower)) =
-                    (&self.anim_config, &self.player_lower)
-                {
-                    let anim = if self.player.is_moving {
-                        &config.legs_run
-                    } else {
-                        &config.legs_idle
-                    };
-                    let frame_in_anim = if anim.looping_frames > 0 {
-                        ((self.player.animation_time * anim.fps as f32) as usize) % anim.looping_frames
-                    } else {
-                        0
-                    };
-                    let frame = anim.first_frame + frame_in_anim;
-                    frame.min(lower.header.num_bone_frames as usize - 1)
-                } else {
-                    0
-                };
-
-                let upper_frame = if let (Some(ref config), Some(ref upper)) =
-                    (&self.anim_config, &self.player_upper)
-                {
-                    let anim = &config.torso_stand;
-                    let frame_in_anim = if anim.looping_frames > 0 {
-                        ((self.start_time.elapsed().as_secs_f32() * anim.fps as f32) as usize)
-                            % anim.looping_frames
-                    } else {
-                        0
-                    };
-                    let frame = anim.first_frame + frame_in_anim;
-                    frame.min(upper.header.num_bone_frames as usize - 1)
-                } else {
-                    0
-                };
 
                 let surface_format = wgpu_renderer.surface_config.format;
 
                 let mut upper_orientation = lower_orientation;
                 let mut head_orientation: Option<Orientation> = None;
+                let mut weapon_orientation: Option<Orientation> = None;
 
                 if let Some(ref lower) = self.player_lower {
                     let model_mat = scale_mat * orientation_to_mat4(&lower_orientation);
@@ -432,14 +754,8 @@ impl ApplicationHandler for GameApp {
                         model_mat,
                         view_proj,
                         camera_pos,
-                        light_pos0,
-                        light_color0,
-                        light_radius0,
-                        light_pos1,
-                        light_color1,
-                        light_radius1,
-                        num_lights,
-                        ambient,
+                        &lights,
+                        lighting.ambient,
                         true,
                     );
 
@@ -467,14 +783,8 @@ impl ApplicationHandler for GameApp {
                         model_mat,
                         view_proj,
                         camera_pos,
-                        light_pos0,
-                        light_color0,
-                        light_radius0,
-                        light_pos1,
-                        light_color1,
-                        light_radius1,
-                        num_lights,
-                        ambient,
+                        &lights,
+                        lighting.ambient,
                         true,
                     );
 
@@ -485,6 +795,14 @@ impl ApplicationHandler for GameApp {
                         }) {
                             head_orientation =
                                 Some(attach_rotated_entity(&upper_orientation, head_tag));
+                        }
+                        
+                        if let Some(weapon_tag) = tags.iter().find(|t| {
+                            let name = std::str::from_utf8(&t.name).unwrap_or("");
+                            name.trim_end_matches('\0') == "tag_weapon"
+                        }) {
+                            weapon_orientation =
+                                Some(attach_rotated_entity(&upper_orientation, weapon_tag));
                         }
                     }
                 }
@@ -504,17 +822,281 @@ impl ApplicationHandler for GameApp {
                         model_mat,
                         view_proj,
                         camera_pos,
-                        light_pos0,
-                        light_color0,
-                        light_radius0,
-                        light_pos1,
-                        light_color1,
-                        light_radius1,
-                        num_lights,
-                        ambient,
+                        &lights,
+                        lighting.ambient,
                         true,
                     );
                 }
+
+                if let (Some(ref weapon), Some(weapon_orient)) =
+                    (&self.weapon, weapon_orientation)
+                {
+                    let model_mat = scale_mat * orientation_to_mat4(&weapon_orient);
+                    md3_renderer.render_model(
+                        &mut encoder,
+                        &view,
+                        depth_view,
+                        surface_format,
+                        weapon,
+                        0,
+                        &self.weapon_textures,
+                        model_mat,
+                        view_proj,
+                        camera_pos,
+                        &lights,
+                        lighting.ambient,
+                        true,
+                    );
+                }
+
+                let player2_rotation = Mat3::from_rotation_y(std::f32::consts::PI) * correction;
+                let player2_lower_axis = axis_from_mat3(player2_rotation);
+                let player2_lower_origin = Vec3::new(25.0, -13.5, 0.0);
+                let player2_lower_orientation = Orientation {
+                    origin: player2_lower_origin,
+                    axis: player2_lower_axis,
+                };
+
+                let mut player2_upper_orientation = player2_lower_orientation;
+                let mut player2_head_orientation: Option<Orientation> = None;
+
+                if let Some(ref lower) = self.player2_lower {
+                    let model_mat = scale_mat * orientation_to_mat4(&player2_lower_orientation);
+                    md3_renderer.render_model(
+                        &mut encoder,
+                        &view,
+                        depth_view,
+                        surface_format,
+                        lower,
+                        0,
+                        &self.player2_lower_textures,
+                        model_mat,
+                        view_proj,
+                        camera_pos,
+                        &lights,
+                        lighting.ambient,
+                        true,
+                    );
+
+                    if let Some(tags) = lower.tags.get(0) {
+                        if let Some(torso_tag) = tags.iter().find(|t| {
+                            let name = std::str::from_utf8(&t.name).unwrap_or("");
+                            name.trim_end_matches('\0') == "tag_torso"
+                        }) {
+                            player2_upper_orientation =
+                                attach_rotated_entity(&player2_lower_orientation, torso_tag);
+                        }
+                    }
+                }
+
+                if let Some(ref upper) = self.player2_upper {
+                    let model_mat = scale_mat * orientation_to_mat4(&player2_upper_orientation);
+                    md3_renderer.render_model(
+                        &mut encoder,
+                        &view,
+                        depth_view,
+                        surface_format,
+                        upper,
+                        0,
+                        &self.player2_upper_textures,
+                        model_mat,
+                        view_proj,
+                        camera_pos,
+                        &lights,
+                        lighting.ambient,
+                        true,
+                    );
+
+                    if let Some(tags) = upper.tags.get(0) {
+                        if let Some(head_tag) = tags.iter().find(|t| {
+                            let name = std::str::from_utf8(&t.name).unwrap_or("");
+                            name.trim_end_matches('\0') == "tag_head"
+                        }) {
+                            player2_head_orientation =
+                                Some(attach_rotated_entity(&player2_upper_orientation, head_tag));
+                        }
+                    }
+                }
+
+                if let (Some(ref head), Some(head_orient)) =
+                    (&self.player2_head, player2_head_orientation)
+                {
+                    let model_mat = scale_mat * orientation_to_mat4(&head_orient);
+                    md3_renderer.render_model(
+                        &mut encoder,
+                        &view,
+                        depth_view,
+                        surface_format,
+                        head,
+                        0,
+                        &self.player2_head_textures,
+                        model_mat,
+                        view_proj,
+                        camera_pos,
+                        &lights,
+                        lighting.ambient,
+                        true,
+                    );
+                }
+
+                for rocket in &self.rockets {
+                    if let Some(ref rocket_model) = self.rocket_model {
+                        let rocket_scale = 0.15;
+                        let rocket_rotation = Mat3::from_rotation_y(
+                            if rocket.velocity.x > 0.0 { 0.0 } else { std::f32::consts::PI }
+                        ) * correction;
+                        
+                        let translation = Mat4::from_translation(rocket.position);
+                        let rotation = Mat4::from_mat3(rocket_rotation);
+                        let scale_mat = Mat4::from_scale(Vec3::splat(rocket_scale));
+                        let model_mat = translation * rotation * scale_mat;
+                        
+                        md3_renderer.render_model(
+                            &mut encoder,
+                            &view,
+                            depth_view,
+                            surface_format,
+                            rocket_model,
+                            0,
+                            &self.rocket_textures,
+                            model_mat,
+                            view_proj,
+                            camera_pos,
+                            &lights,
+                            lighting.ambient,
+                            false,
+                        );
+                    }
+                }
+
+                let mut shadow_models = Vec::new();
+
+                if let Some(ref lower) = self.player_lower {
+                    let model_mat = scale_mat * orientation_to_mat4(&lower_orientation);
+                    shadow_models.push((
+                        lower,
+                        lower_frame,
+                        self.lower_textures.as_slice(),
+                        model_mat,
+                    ));
+                }
+
+                if let Some(ref upper) = self.player_upper {
+                    let model_mat = scale_mat * orientation_to_mat4(&upper_orientation);
+                    shadow_models.push((
+                        upper,
+                        upper_frame,
+                        self.upper_textures.as_slice(),
+                        model_mat,
+                    ));
+                }
+
+                if let (Some(ref head), Some(head_orient)) =
+                    (&self.player_head, head_orientation)
+                {
+                    let model_mat = scale_mat * orientation_to_mat4(&head_orient);
+                    shadow_models.push((
+                        head,
+                        0,
+                        self.head_textures.as_slice(),
+                        model_mat,
+                    ));
+                }
+
+                if let (Some(ref weapon), Some(weapon_orient)) =
+                    (&self.weapon, weapon_orientation)
+                {
+                    let model_mat = scale_mat * orientation_to_mat4(&weapon_orient);
+                    shadow_models.push((
+                        weapon,
+                        0,
+                        self.weapon_textures.as_slice(),
+                        model_mat,
+                    ));
+                }
+
+                if let Some(ref lower) = self.player2_lower {
+                    let model_mat = scale_mat * orientation_to_mat4(&player2_lower_orientation);
+                    shadow_models.push((
+                        lower,
+                        0,
+                        self.player2_lower_textures.as_slice(),
+                        model_mat,
+                    ));
+                }
+
+                if let Some(ref upper) = self.player2_upper {
+                    let model_mat = scale_mat * orientation_to_mat4(&player2_upper_orientation);
+                    shadow_models.push((
+                        upper,
+                        0,
+                        self.player2_upper_textures.as_slice(),
+                        model_mat,
+                    ));
+                }
+
+                if let (Some(ref head), Some(head_orient)) =
+                    (&self.player2_head, player2_head_orientation)
+                {
+                    let model_mat = scale_mat * orientation_to_mat4(&head_orient);
+                    shadow_models.push((
+                        head,
+                        0,
+                        self.player2_head_textures.as_slice(),
+                        model_mat,
+                    ));
+                }
+
+                md3_renderer.render_wall_shadows_batch(
+                    &mut encoder,
+                    &view,
+                    depth_view,
+                    view_proj,
+                    camera_pos,
+                    &lights,
+                    lighting.ambient,
+                    &shadow_models,
+                );
+
+                let mut flame_positions = Vec::new();
+                for rocket in &self.rockets {
+                    let flame_offset = if rocket.velocity.x > 0.0 { -1.2 } else { 1.2 };
+                    flame_positions.push((rocket.position + Vec3::new(flame_offset, 0.0, 0.0), 3.0));
+                    flame_positions.push((rocket.position + Vec3::new(flame_offset * 0.7, 0.0, 0.0), 2.0));
+                }
+                
+                self.last_debug_log += dt;
+                if self.last_debug_log > 0.1 && !self.rockets.is_empty() {
+                    for (i, rocket) in self.rockets.iter().enumerate() {
+                        let flame_offset = if rocket.velocity.x > 0.0 { -1.2 } else { 1.2 };
+                        let flame_pos = rocket.position + Vec3::new(flame_offset, 0.0, 0.0);
+                        println!("🚀 Rocket[{}]: pos={:.2?} | 🔥 Flame: pos={:.2?}", i, rocket.position, flame_pos);
+                    }
+                    self.last_debug_log = 0.0;
+                }
+
+                md3_renderer.render_flames(
+                    &mut encoder,
+                    &view,
+                    depth_view,
+                    view_proj,
+                    camera_pos,
+                    &flame_positions,
+                    now.duration_since(self.start_time).as_secs_f32(),
+                );
+
+                let smoke_data: Vec<(Vec3, f32, f32)> = self.smoke_particles.iter()
+                    .map(|p| (p.position, p.size, p.alpha()))
+                    .collect();
+
+                md3_renderer.render_particles(
+                    &mut encoder,
+                    &view,
+                    depth_view,
+                    view_proj,
+                    camera_pos,
+                    &smoke_data,
+                );
 
                 wgpu_renderer.queue.submit(Some(encoder.finish()));
                 wgpu_renderer.end_frame(frame);
