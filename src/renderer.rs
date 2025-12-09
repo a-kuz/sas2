@@ -6,7 +6,7 @@ use winit::window::Window;
 use glam::{Mat4, Vec3};
 use bytemuck::{Pod, Zeroable};
 use crate::md3::MD3Model;
-use crate::shaders::{MD3_SHADER, GROUND_SHADER, SHADOW_SHADER, WALL_SHADOW_SHADER, PARTICLE_SHADER, FLAME_SHADER};
+use crate::shaders::{MD3_SHADER, GROUND_SHADER, SHADOW_SHADER, WALL_SHADOW_SHADER, PARTICLE_SHADER, FLAME_SHADER, WALL_SHADER};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -171,11 +171,24 @@ impl WgpuRenderer {
 }
 
 struct MeshRenderData {
-    vertex_buffer: Buffer,
-    index_buffer: Buffer,
+    vertex_buffer: Arc<Buffer>,
+    index_buffer: Arc<Buffer>,
     num_indices: u32,
     bind_group: BindGroup,
     shadow_bind_group: Option<BindGroup>,
+}
+
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct BufferCacheKey {
+    model_id: usize,
+    mesh_idx: usize,
+    frame_idx: usize,
+}
+
+struct CachedBuffers {
+    vertex_buffer: Arc<Buffer>,
+    index_buffer: Arc<Buffer>,
+    num_indices: u32,
 }
 
 pub struct MD3Renderer {
@@ -183,6 +196,7 @@ pub struct MD3Renderer {
     pub queue: Arc<Queue>,
     pub pipeline: Option<RenderPipeline>,
     pub ground_pipeline: Option<RenderPipeline>,
+    pub wall_pipeline: Option<RenderPipeline>,
     pub shadow_pipeline: Option<RenderPipeline>,
     pub wall_shadow_pipeline: Option<RenderPipeline>,
     pub particle_pipeline: Option<RenderPipeline>,
@@ -190,25 +204,43 @@ pub struct MD3Renderer {
     pub uniform_buffer: Option<Buffer>,
     pub bind_group_layout: BindGroupLayout,
     pub ground_bind_group_layout: BindGroupLayout,
+    pub wall_bind_group_layout: BindGroupLayout,
     pub particle_bind_group_layout: BindGroupLayout,
     pub model_textures: HashMap<String, WgpuTexture>,
     pub ground_vertex_buffer: Option<Buffer>,
     pub ground_index_buffer: Option<Buffer>,
+    pub ground_texture: Option<WgpuTexture>,
     pub wall_vertex_buffer: Option<Buffer>,
     pub wall_index_buffer: Option<Buffer>,
+    pub wall_texture: Option<WgpuTexture>,
+    pub wall_curb_texture: Option<WgpuTexture>,
+    buffer_cache: HashMap<BufferCacheKey, CachedBuffers>,
+    uniform_buffer_pool: Option<Buffer>,
+    shadow_uniform_buffer_pool: Option<Buffer>,
+    ground_uniform_buffer: Option<Buffer>,
+    wall_uniform_buffer: Option<Buffer>,
 }
 
 impl MD3Renderer {
     pub fn new(device: Arc<Device>, queue: Arc<Queue>) -> Self {
         let bind_group_layout = Self::create_md3_bind_group_layout(&device);
         let ground_bind_group_layout = Self::create_ground_bind_group_layout(&device);
+        let wall_bind_group_layout = Self::create_wall_bind_group_layout(&device);
         let particle_bind_group_layout = Self::create_particle_bind_group_layout(&device);
+
+        let uniform_buffer_pool = Some(device.create_buffer(&BufferDescriptor {
+            label: Some("Uniform Buffer Pool"),
+            size: std::mem::size_of::<MD3Uniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
 
         Self {
             device,
             queue,
             pipeline: None,
             ground_pipeline: None,
+            wall_pipeline: None,
             shadow_pipeline: None,
             wall_shadow_pipeline: None,
             particle_pipeline: None,
@@ -216,12 +248,21 @@ impl MD3Renderer {
             uniform_buffer: None,
             bind_group_layout,
             ground_bind_group_layout,
+            wall_bind_group_layout,
             particle_bind_group_layout,
             model_textures: HashMap::new(),
             ground_vertex_buffer: None,
             ground_index_buffer: None,
+            ground_texture: None,
             wall_vertex_buffer: None,
             wall_index_buffer: None,
+            wall_texture: None,
+            wall_curb_texture: None,
+            buffer_cache: HashMap::new(),
+            uniform_buffer_pool,
+            shadow_uniform_buffer_pool: None,
+            ground_uniform_buffer: None,
+            wall_uniform_buffer: None,
         }
     }
 
@@ -269,8 +310,74 @@ impl MD3Renderer {
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: None,
+                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<MD3Uniforms>() as u64),
                     },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        })
+    }
+
+    fn create_wall_bind_group_layout(device: &Device) -> BindGroupLayout {
+        device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Wall Bind Group Layout"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<MD3Uniforms>() as u64),
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -405,6 +512,40 @@ impl MD3Renderer {
         });
 
         self.ground_pipeline = Some(ground_pipeline);
+
+        let wall_shader = self.device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Wall Shader"),
+            source: ShaderSource::Wgsl(WALL_SHADER.into()),
+        });
+
+        let wall_pipeline_layout = self.device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Wall Pipeline Layout"),
+            bind_group_layouts: &[&self.wall_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let wall_pipeline = self.device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Wall Pipeline"),
+            layout: Some(&wall_pipeline_layout),
+            vertex: VertexState {
+                module: &wall_shader,
+                entry_point: "vs_main",
+                buffers: &[VertexData::desc()],
+                compilation_options: PipelineCompilationOptions::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &wall_shader,
+                entry_point: "fs_main",
+                targets: &[Some(Self::create_color_target_state(surface_format))],
+                compilation_options: PipelineCompilationOptions::default(),
+            }),
+            primitive: Self::create_primitive_state(None),
+            depth_stencil: Some(Self::create_depth_stencil_state(true)),
+            multisample: Self::create_multisample_state(),
+            multiview: None,
+        });
+
+        self.wall_pipeline = Some(wall_pipeline);
 
         let shadow_shader = self.device.create_shader_module(ShaderModuleDescriptor {
             label: Some("Shadow Shader"),
@@ -582,19 +723,22 @@ impl MD3Renderer {
 
         self.ground_vertex_buffer = Some(ground_vertex_buffer);
         self.ground_index_buffer = Some(ground_index_buffer);
+        
+        self.create_ground_texture();
 
         let wall_size = 500.0;
         let wall_height = 50.0;
         let wall_z = -3.0;
+        let wall_bottom = -1.5;
         let wall_vertices = vec![
             VertexData {
-                position: [-wall_size, -1.5, wall_z],
+                position: [-wall_size, wall_bottom, wall_z],
                 uv: [0.0, 0.0],
                 color: [1.0, 1.0, 1.0, 1.0],
                 normal: [0.0, 0.0, 1.0],
             },
             VertexData {
-                position: [wall_size, -1.5, wall_z],
+                position: [wall_size, wall_bottom, wall_z],
                 uv: [1.0, 0.0],
                 color: [1.0, 1.0, 1.0, 1.0],
                 normal: [0.0, 0.0, 1.0],
@@ -731,7 +875,30 @@ impl MD3Renderer {
         self.flame_pipeline = Some(flame_pipeline);
     }
 
-    fn create_buffers(&self, model: &MD3Model, mesh_idx: usize, frame_idx: usize) -> Option<(Buffer, Buffer, u32)> {
+    fn get_or_create_buffers(&mut self, model: &MD3Model, mesh_idx: usize, frame_idx: usize) -> Option<(Arc<Buffer>, Arc<Buffer>, u32)> {
+        let model_id = std::ptr::addr_of!(*model) as usize;
+        let key = BufferCacheKey {
+            model_id,
+            mesh_idx,
+            frame_idx,
+        };
+        
+        if let Some(cached) = self.buffer_cache.get(&key) {
+            return Some((cached.vertex_buffer.clone(), cached.index_buffer.clone(), cached.num_indices));
+        }
+        
+        let (vertex_buffer, index_buffer, num_indices) = self.create_buffers_internal(model, mesh_idx, frame_idx)?;
+        let cached = CachedBuffers {
+            vertex_buffer: Arc::new(vertex_buffer),
+            index_buffer: Arc::new(index_buffer),
+            num_indices,
+        };
+        let result = (cached.vertex_buffer.clone(), cached.index_buffer.clone(), cached.num_indices);
+        self.buffer_cache.insert(key, cached);
+        Some(result)
+    }
+    
+    fn create_buffers_internal(&self, model: &MD3Model, mesh_idx: usize, frame_idx: usize) -> Option<(Buffer, Buffer, u32)> {
         if mesh_idx >= model.meshes.len() {
             return None;
         }
@@ -830,13 +997,10 @@ impl MD3Renderer {
         }
     }
 
-    fn create_uniform_buffer(&self, uniforms: &MD3Uniforms, label: &str) -> Buffer {
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: bytemuck::cast_slice(&[*uniforms]),
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-        })
+    fn update_uniform_buffer(&self, uniforms: &MD3Uniforms, buffer: &Buffer) {
+        self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[*uniforms]));
     }
+    
 
     fn find_texture(&self, path: &str) -> Option<&WgpuTexture> {
         let mut alt_paths = vec![
@@ -927,7 +1091,7 @@ impl MD3Renderer {
     }
 
     fn prepare_mesh_data(
-        &self,
+        &mut self,
         model: &MD3Model,
         frame_idx: usize,
         texture_paths: &[Option<String>],
@@ -935,17 +1099,24 @@ impl MD3Renderer {
         shadow_uniform_buffer: Option<&Buffer>,
         render_shadow: bool,
     ) -> Vec<MeshRenderData> {
-        let mut mesh_data = Vec::new();
-
+        let mut buffers_vec = Vec::new();
+        
         for (mesh_idx, _mesh) in model.meshes.iter().enumerate() {
-            let (vertex_buffer, index_buffer, num_indices) = match self.create_buffers(model, mesh_idx, frame_idx) {
+            let (vertex_buffer, index_buffer, num_indices) = match self.get_or_create_buffers(model, mesh_idx, frame_idx) {
                 Some(buffers) => buffers,
                 None => continue,
             };
             
-            let texture_path = texture_paths.get(mesh_idx).and_then(|p| p.as_ref().map(|s| s.as_str()));
-            let texture = texture_path.and_then(|path| self.find_texture(path));
+            let texture_path = texture_paths.get(mesh_idx).and_then(|p| p.as_ref().map(|s| s.clone()));
 
+            if texture_path.is_some() {
+                buffers_vec.push((vertex_buffer, index_buffer, num_indices, texture_path));
+            }
+        }
+        
+        let mut mesh_data = Vec::new();
+        for (vertex_buffer, index_buffer, num_indices, texture_path) in buffers_vec {
+            let texture = texture_path.as_ref().and_then(|path| self.find_texture(path));
             if let Some(texture) = texture {
                 let (bind_group, shadow_bind_group) = self.create_mesh_bind_groups(
                     texture,
@@ -977,6 +1148,10 @@ impl MD3Renderer {
         lights: &[(Vec3, Vec3, f32)],
         ambient_light: f32,
     ) {
+        if self.ground_texture.is_none() {
+            self.create_ground_texture();
+        }
+
         let uniforms = self.create_uniforms(
             view_proj,
             Mat4::IDENTITY,
@@ -985,7 +1160,17 @@ impl MD3Renderer {
             ambient_light,
         );
 
-        let ground_uniform_buffer = self.create_uniform_buffer(&uniforms, "Ground Uniform Buffer");
+        if self.ground_uniform_buffer.is_none() {
+            self.ground_uniform_buffer = Some(self.device.create_buffer(&BufferDescriptor {
+                label: Some("Ground Uniform Buffer"),
+                size: std::mem::size_of::<MD3Uniforms>() as u64,
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let ground_uniform_buffer = self.ground_uniform_buffer.as_ref().unwrap();
+        self.update_uniform_buffer(&uniforms, ground_uniform_buffer);
+        let ground_tex = self.ground_texture.as_ref().unwrap();
 
         let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
             label: Some("Ground Bind Group"),
@@ -994,6 +1179,14 @@ impl MD3Renderer {
                 BindGroupEntry {
                     binding: 0,
                     resource: ground_uniform_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(&ground_tex.view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Sampler(&ground_tex.sampler),
                 },
             ],
         });
@@ -1028,6 +1221,559 @@ impl MD3Renderer {
         render_pass.draw_indexed(0..6, 0, 0..1);
     }
 
+    pub fn create_ground_texture(&mut self) {
+        let texture_paths = vec![
+            "../q3-resources/textures/base_floor/clang_floor3b.png",
+            "../q3-resources/textures/base_floor/clang_floor3b.jpg",
+            "../q3-resources/textures/base_floor/clang_floor3b.tga",
+            "../q3-resources/textures/base_floor/clang_floor3.png",
+            "../q3-resources/textures/base_floor/clang_floor3.jpg",
+            "../q3-resources/textures/base_floor/clang_floor3.tga",
+            "../q3-resources/textures/base_floor/clang_floor2.png",
+            "../q3-resources/textures/base_floor/clang_floor2.jpg",
+            "../q3-resources/textures/base_floor/clang_floor2.tga",
+            "../q3-resources/textures/base_floor/clang_floor1.png",
+            "../q3-resources/textures/base_floor/clang_floor1.jpg",
+            "../q3-resources/textures/base_floor/clang_floor1.tga",
+            "../q3-resources/textures/base_floor/floor1.png",
+            "../q3-resources/textures/base_floor/floor1.jpg",
+            "../q3-resources/textures/base_floor/floor1.tga",
+            "q3-resources/textures/base_floor/clang_floor3b.png",
+            "q3-resources/textures/base_floor/clang_floor3b.jpg",
+            "q3-resources/textures/base_floor/clang_floor3b.tga",
+            "q3-resources/textures/base_floor/clang_floor3.png",
+            "q3-resources/textures/base_floor/clang_floor3.jpg",
+            "q3-resources/textures/base_floor/clang_floor3.tga",
+            "q3-resources/textures/base_floor/clang_floor2.png",
+            "q3-resources/textures/base_floor/clang_floor2.jpg",
+            "q3-resources/textures/base_floor/clang_floor2.tga",
+            "q3-resources/textures/base_floor/clang_floor1.png",
+            "q3-resources/textures/base_floor/clang_floor1.jpg",
+            "q3-resources/textures/base_floor/clang_floor1.tga",
+            "q3-resources/textures/base_floor/floor1.png",
+            "q3-resources/textures/base_floor/floor1.jpg",
+            "q3-resources/textures/base_floor/floor1.tga",
+        ];
+
+        let mut texture_loaded = false;
+        for texture_path in texture_paths {
+            if std::path::Path::new(&texture_path).exists() {
+                if let Ok(data) = std::fs::read(&texture_path) {
+                    if let Ok(img) = image::load_from_memory(&data) {
+                        let img = img.to_rgba8();
+                        let size = Extent3d {
+                            width: img.width(),
+                            height: img.height(),
+                            depth_or_array_layers: 1,
+                        };
+                        let texture = self.device.create_texture(&TextureDescriptor {
+                            label: Some("Ground Texture"),
+                            size,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: TextureDimension::D2,
+                            format: TextureFormat::Rgba8UnormSrgb,
+                            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+
+                        self.queue.write_texture(
+                            ImageCopyTexture {
+                                texture: &texture,
+                                mip_level: 0,
+                                origin: Origin3d::ZERO,
+                                aspect: TextureAspect::All,
+                            },
+                            &img,
+                            ImageDataLayout {
+                                offset: 0,
+                                bytes_per_row: Some(4 * img.width()),
+                                rows_per_image: Some(img.height()),
+                            },
+                            size,
+                        );
+
+                        let view = texture.create_view(&TextureViewDescriptor::default());
+                        let sampler = self.device.create_sampler(&SamplerDescriptor {
+                            address_mode_u: AddressMode::Repeat,
+                            address_mode_v: AddressMode::Repeat,
+                            address_mode_w: AddressMode::Repeat,
+                            mag_filter: FilterMode::Linear,
+                            min_filter: FilterMode::Linear,
+                            mipmap_filter: FilterMode::Linear,
+                            ..Default::default()
+                        });
+
+                        self.ground_texture = Some(WgpuTexture {
+                            texture,
+                            view,
+                            sampler,
+                        });
+                        texture_loaded = true;
+                        println!("Loaded ground texture from: {}", texture_path);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !texture_loaded {
+            println!("Warning: Could not load ground texture, using fallback");
+            let size = 128u32;
+            let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+            
+            for y in 0..size {
+                for x in 0..size {
+                    let fx = x as f32 / size as f32;
+                    let fy = y as f32 / size as f32;
+                    
+                    let checker = ((fx * 8.0).floor() + (fy * 8.0).floor()) as i32;
+                    let is_dark = checker % 2 == 0;
+                    let r = if is_dark { 0.25 } else { 0.18 };
+                    let g = if is_dark { 0.25 } else { 0.18 };
+                    let b = if is_dark { 0.28 } else { 0.2 };
+                    
+                    pixels.push((r * 255.0) as u8);
+                    pixels.push((g * 255.0) as u8);
+                    pixels.push((b * 255.0) as u8);
+                    pixels.push(255);
+                }
+            }
+            
+            let texture = self.device.create_texture(&TextureDescriptor {
+                label: Some("Ground Texture Fallback"),
+                size: Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8UnormSrgb,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+
+            self.queue.write_texture(
+                ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                &pixels,
+                ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * size),
+                    rows_per_image: Some(size),
+                },
+                Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let view = texture.create_view(&TextureViewDescriptor::default());
+            let sampler = self.device.create_sampler(&SamplerDescriptor {
+                address_mode_u: AddressMode::Repeat,
+                address_mode_v: AddressMode::Repeat,
+                address_mode_w: AddressMode::Repeat,
+                mag_filter: FilterMode::Linear,
+                min_filter: FilterMode::Linear,
+                mipmap_filter: FilterMode::Linear,
+                ..Default::default()
+            });
+
+            self.ground_texture = Some(WgpuTexture {
+                texture,
+                view,
+                sampler,
+            });
+        }
+    }
+
+    pub fn create_wall_texture(&mut self) {
+        let texture_paths = vec![
+            "../q3-resources/textures/base_wall/atech2_c.png",
+            "../q3-resources/textures/base_wall/atech2_c.jpg",
+            "../q3-resources/textures/base_wall/atech2_c.tga",
+            "../q3-resources/textures/base_wall/atech3_a.png",
+            "../q3-resources/textures/base_wall/atech3_a.jpg",
+            "../q3-resources/textures/base_wall/atech3_a.tga",
+            "../q3-resources/textures/base_wall/basewall04.png",
+            "../q3-resources/textures/base_wall/basewall04.jpg",
+            "../q3-resources/textures/base_wall/basewall04.tga",
+            "../q3-resources/textures/base_wall/concrete.png",
+            "../q3-resources/textures/base_wall/concrete.jpg",
+            "../q3-resources/textures/base_wall/concrete.tga",
+            "../q3-resources/textures/base_wall/atech1_a.png",
+            "../q3-resources/textures/base_wall/atech1_a.jpg",
+            "q3-resources/textures/base_wall/atech2_c.png",
+            "q3-resources/textures/base_wall/atech2_c.jpg",
+            "q3-resources/textures/base_wall/atech2_c.tga",
+            "q3-resources/textures/base_wall/atech3_a.png",
+            "q3-resources/textures/base_wall/atech3_a.jpg",
+            "q3-resources/textures/base_wall/atech3_a.tga",
+            "q3-resources/textures/base_wall/basewall04.png",
+            "q3-resources/textures/base_wall/basewall04.jpg",
+            "q3-resources/textures/base_wall/basewall04.tga",
+            "q3-resources/textures/base_wall/concrete.png",
+            "q3-resources/textures/base_wall/concrete.jpg",
+            "q3-resources/textures/base_wall/concrete.tga",
+            "q3-resources/textures/base_wall/atech1_a.png",
+            "q3-resources/textures/base_wall/atech1_a.jpg",
+            "../q3-resources/textures/base_wall/atech1_a.tga",
+            "q3-resources/textures/base_wall/atech1_a.tga",
+        ];
+
+        let mut texture_loaded = false;
+        for texture_path in texture_paths {
+            if std::path::Path::new(&texture_path).exists() {
+                if let Ok(data) = std::fs::read(&texture_path) {
+                    if let Ok(img) = image::load_from_memory(&data) {
+                        let img = img.to_rgba8();
+                        let size = Extent3d {
+                            width: img.width(),
+                            height: img.height(),
+                            depth_or_array_layers: 1,
+                        };
+                        let texture = self.device.create_texture(&TextureDescriptor {
+                            label: Some("Wall Texture"),
+                            size,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: TextureDimension::D2,
+                            format: TextureFormat::Rgba8UnormSrgb,
+                            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+
+                        self.queue.write_texture(
+                            ImageCopyTexture {
+                                texture: &texture,
+                                mip_level: 0,
+                                origin: Origin3d::ZERO,
+                                aspect: TextureAspect::All,
+                            },
+                            &img,
+                            ImageDataLayout {
+                                offset: 0,
+                                bytes_per_row: Some(4 * img.width()),
+                                rows_per_image: Some(img.height()),
+                            },
+                            size,
+                        );
+
+                        let view = texture.create_view(&TextureViewDescriptor::default());
+                        let sampler = self.device.create_sampler(&SamplerDescriptor {
+                            address_mode_u: AddressMode::Repeat,
+                            address_mode_v: AddressMode::Repeat,
+                            address_mode_w: AddressMode::Repeat,
+                            mag_filter: FilterMode::Linear,
+                            min_filter: FilterMode::Linear,
+                            mipmap_filter: FilterMode::Linear,
+                            ..Default::default()
+                        });
+
+                        self.wall_texture = Some(WgpuTexture {
+                            texture,
+                            view,
+                            sampler,
+                        });
+                        texture_loaded = true;
+                        println!("Loaded wall texture from: {}", texture_path);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let curb_texture_paths = vec![
+            "../q3-resources/textures/base_trim/border11.png",
+            "../q3-resources/textures/base_trim/border11.jpg",
+            "../q3-resources/textures/base_trim/border11.tga",
+            "../q3-resources/textures/base_trim/spiderbit4.png",
+            "../q3-resources/textures/base_trim/spiderbit4.jpg",
+            "../q3-resources/textures/base_trim/spiderbit4.tga",
+            "../q3-resources/textures/base_trim/dirty_pewter_big.png",
+            "../q3-resources/textures/base_trim/dirty_pewter_big.jpg",
+            "../q3-resources/textures/base_trim/dirty_pewter_big.tga",
+            "../q3-resources/textures/base_trim/rusty_pewter_big.png",
+            "../q3-resources/textures/base_trim/rusty_pewter_big.jpg",
+            "../q3-resources/textures/base_trim/rusty_pewter_big.tga",
+            "../q3-resources/textures/base_trim/metal2_2.png",
+            "../q3-resources/textures/base_trim/metal2_2.jpg",
+            "../q3-resources/textures/base_trim/metal2_2.tga",
+            "../q3-resources/textures/base_trim/pewter.png",
+            "../q3-resources/textures/base_trim/pewter.jpg",
+            "../q3-resources/textures/base_trim/pewter.tga",
+            "../q3-resources/textures/base_trim/tin.png",
+            "../q3-resources/textures/base_trim/tin.jpg",
+            "../q3-resources/textures/base_trim/tin.tga",
+            "q3-resources/textures/base_trim/border11.png",
+            "q3-resources/textures/base_trim/border11.jpg",
+            "q3-resources/textures/base_trim/border11.tga",
+            "q3-resources/textures/base_trim/spiderbit4.png",
+            "q3-resources/textures/base_trim/spiderbit4.jpg",
+            "q3-resources/textures/base_trim/spiderbit4.tga",
+            "q3-resources/textures/base_trim/dirty_pewter_big.png",
+            "q3-resources/textures/base_trim/dirty_pewter_big.jpg",
+            "q3-resources/textures/base_trim/dirty_pewter_big.tga",
+            "q3-resources/textures/base_trim/rusty_pewter_big.png",
+            "q3-resources/textures/base_trim/rusty_pewter_big.jpg",
+            "q3-resources/textures/base_trim/rusty_pewter_big.tga",
+            "q3-resources/textures/base_trim/metal2_2.png",
+            "q3-resources/textures/base_trim/metal2_2.jpg",
+            "q3-resources/textures/base_trim/metal2_2.tga",
+            "q3-resources/textures/base_trim/pewter.png",
+            "q3-resources/textures/base_trim/pewter.jpg",
+            "q3-resources/textures/base_trim/pewter.tga",
+            "q3-resources/textures/base_trim/tin.png",
+            "q3-resources/textures/base_trim/tin.jpg",
+            "q3-resources/textures/base_trim/tin.tga",
+        ];
+
+        let mut curb_texture_loaded = false;
+        for texture_path in curb_texture_paths {
+            if std::path::Path::new(&texture_path).exists() {
+                if let Ok(data) = std::fs::read(&texture_path) {
+                    if let Ok(img) = image::load_from_memory(&data) {
+                        let img = img.to_rgba8();
+                        let size = Extent3d {
+                            width: img.width(),
+                            height: img.height(),
+                            depth_or_array_layers: 1,
+                        };
+                        let texture = self.device.create_texture(&TextureDescriptor {
+                            label: Some("Wall Curb Texture"),
+                            size,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: TextureDimension::D2,
+                            format: TextureFormat::Rgba8UnormSrgb,
+                            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+
+                        self.queue.write_texture(
+                            ImageCopyTexture {
+                                texture: &texture,
+                                mip_level: 0,
+                                origin: Origin3d::ZERO,
+                                aspect: TextureAspect::All,
+                            },
+                            &img,
+                            ImageDataLayout {
+                                offset: 0,
+                                bytes_per_row: Some(4 * img.width()),
+                                rows_per_image: Some(img.height()),
+                            },
+                            size,
+                        );
+
+                        let view = texture.create_view(&TextureViewDescriptor::default());
+                        let sampler = self.device.create_sampler(&SamplerDescriptor {
+                            address_mode_u: AddressMode::Repeat,
+                            address_mode_v: AddressMode::Repeat,
+                            address_mode_w: AddressMode::Repeat,
+                            mag_filter: FilterMode::Linear,
+                            min_filter: FilterMode::Linear,
+                            mipmap_filter: FilterMode::Linear,
+                            ..Default::default()
+                        });
+
+                        self.wall_curb_texture = Some(WgpuTexture {
+                            texture,
+                            view,
+                            sampler,
+                        });
+                        curb_texture_loaded = true;
+                        println!("Loaded wall curb texture from: {}", texture_path);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !curb_texture_loaded {
+            println!("Warning: Could not load wall curb texture, creating fallback");
+            let size = 128u32;
+            let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+            
+            for y in 0..size {
+                for x in 0..size {
+                    let fx = x as f32 / size as f32;
+                    let fy = y as f32 / size as f32;
+                    
+                    let rust_pattern = (fx * 4.0).sin() * (fy * 4.0).cos();
+                    let base_rust_r = 0.4;
+                    let base_rust_g = 0.25;
+                    let base_rust_b = 0.15;
+                    let rust_highlight_r = 0.6;
+                    let rust_highlight_g = 0.35;
+                    let rust_highlight_b = 0.2;
+                    let mix_factor = rust_pattern * 0.5 + 0.5;
+                    let rust_r = base_rust_r + (rust_highlight_r - base_rust_r) * mix_factor;
+                    let rust_g = base_rust_g + (rust_highlight_g - base_rust_g) * mix_factor;
+                    let rust_b = base_rust_b + (rust_highlight_b - base_rust_b) * mix_factor;
+                    
+                    let rivet_dx = fx - 0.5;
+                    let rivet_dy = fy - 0.5;
+                    let rivet_dist = (rivet_dx * rivet_dx + rivet_dy * rivet_dy).sqrt();
+                    let rivet = if rivet_dist < 0.1 {
+                        1.0 - (rivet_dist - 0.1) / 0.05
+                    } else if rivet_dist < 0.15 {
+                        1.0 - (rivet_dist - 0.1) / 0.05
+                    } else {
+                        0.0
+                    };
+                    let rivet_r = rust_r + (0.7 - rust_r) * rivet;
+                    let rivet_g = rust_g + (0.6 - rust_g) * rivet;
+                    let rivet_b = rust_b + (0.4 - rust_b) * rivet;
+                    
+                    pixels.push((rivet_r * 255.0) as u8);
+                    pixels.push((rivet_g * 255.0) as u8);
+                    pixels.push((rivet_b * 255.0) as u8);
+                    pixels.push(255);
+                }
+            }
+            
+            let texture = self.device.create_texture(&TextureDescriptor {
+                label: Some("Wall Curb Texture Fallback"),
+                size: Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8UnormSrgb,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+
+            self.queue.write_texture(
+                ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                &pixels,
+                ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * size),
+                    rows_per_image: Some(size),
+                },
+                Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let view = texture.create_view(&TextureViewDescriptor::default());
+            let sampler = self.device.create_sampler(&SamplerDescriptor {
+                address_mode_u: AddressMode::Repeat,
+                address_mode_v: AddressMode::Repeat,
+                address_mode_w: AddressMode::Repeat,
+                mag_filter: FilterMode::Linear,
+                min_filter: FilterMode::Linear,
+                mipmap_filter: FilterMode::Linear,
+                ..Default::default()
+            });
+
+            self.wall_curb_texture = Some(WgpuTexture {
+                texture,
+                view,
+                sampler,
+            });
+        }
+
+        if !texture_loaded {
+            println!("Warning: Could not load wall texture, using fallback");
+            let size = 128u32;
+            let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+            
+            for y in 0..size {
+                for x in 0..size {
+                    let fx = x as f32 / size as f32;
+                    let fy = y as f32 / size as f32;
+                    
+                    let noise_x = (fx * 8.0 + (fy * 3.14159).sin() * 0.3).fract();
+                    let noise_y = (fy * 8.0 + (fx * 2.71828).cos() * 0.3).fract();
+                    
+                    let stone_pattern = (noise_x * 3.14159).sin() * (noise_y * 2.71828).cos();
+                    let base_gray = 0.4 + stone_pattern * 0.15;
+                    
+                    let r = base_gray + (fx * 10.0).sin() * 0.05;
+                    let g = base_gray + (fy * 7.0).cos() * 0.05;
+                    let b = base_gray + ((fx + fy) * 5.0).sin() * 0.05;
+                    
+                    pixels.push((r * 255.0) as u8);
+                    pixels.push((g * 255.0) as u8);
+                    pixels.push((b * 255.0) as u8);
+                    pixels.push(255);
+                }
+            }
+            
+            let texture = self.device.create_texture(&TextureDescriptor {
+                label: Some("Wall Texture Fallback"),
+                size: Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8UnormSrgb,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+
+            self.queue.write_texture(
+                ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                &pixels,
+                ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * size),
+                    rows_per_image: Some(size),
+                },
+                Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let view = texture.create_view(&TextureViewDescriptor::default());
+            let sampler = self.device.create_sampler(&SamplerDescriptor {
+                address_mode_u: AddressMode::Repeat,
+                address_mode_v: AddressMode::Repeat,
+                address_mode_w: AddressMode::Repeat,
+                mag_filter: FilterMode::Linear,
+                min_filter: FilterMode::Linear,
+                mipmap_filter: FilterMode::Linear,
+                ..Default::default()
+            });
+
+            self.wall_texture = Some(WgpuTexture {
+                texture,
+                view,
+                sampler,
+            });
+        }
+    }
+
     pub fn render_wall(
         &mut self,
         encoder: &mut CommandEncoder,
@@ -1038,6 +1784,10 @@ impl MD3Renderer {
         lights: &[(Vec3, Vec3, f32)],
         ambient_light: f32,
     ) {
+        if self.wall_texture.is_none() {
+            self.create_wall_texture();
+        }
+
         let uniforms = self.create_uniforms(
             view_proj,
             Mat4::IDENTITY,
@@ -1046,20 +1796,50 @@ impl MD3Renderer {
             ambient_light,
         );
 
-        let wall_uniform_buffer = self.create_uniform_buffer(&uniforms, "Wall Uniform Buffer");
+        if self.wall_uniform_buffer.is_none() {
+            self.wall_uniform_buffer = Some(self.device.create_buffer(&BufferDescriptor {
+                label: Some("Wall Uniform Buffer"),
+                size: std::mem::size_of::<MD3Uniforms>() as u64,
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let wall_uniform_buffer = self.wall_uniform_buffer.as_ref().unwrap();
+        self.update_uniform_buffer(&uniforms, wall_uniform_buffer);
+        let wall_tex = self.wall_texture.as_ref().unwrap();
+        let curb_tex = self.wall_curb_texture.as_ref().unwrap_or_else(|| {
+            println!("Error: wall_curb_texture is None, using wall_texture as fallback");
+            wall_tex
+        });
 
         let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
             label: Some("Wall Bind Group"),
-            layout: &self.ground_bind_group_layout,
+            layout: &self.wall_bind_group_layout,
             entries: &[
                 BindGroupEntry {
                     binding: 0,
                     resource: wall_uniform_buffer.as_entire_binding(),
                 },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(&wall_tex.view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Sampler(&wall_tex.sampler),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: BindingResource::TextureView(&curb_tex.view),
+                },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: BindingResource::Sampler(&curb_tex.sampler),
+                },
             ],
         });
 
-        let pipeline = self.ground_pipeline.as_ref().unwrap();
+        let pipeline = self.wall_pipeline.as_ref().unwrap();
         let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("Wall Render Pass"),
             color_attachments: &[Some(RenderPassColorAttachment {
@@ -1117,14 +1897,22 @@ impl MD3Renderer {
             ambient_light,
         );
 
-        let uniform_buffer = self.create_uniform_buffer(&uniforms, "MD3 Uniform Buffer");
+        let uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Model Uniform Buffer"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        });
 
         let shadow_uniform_buffer = if render_shadow {
-            Some(self.create_uniform_buffer(&uniforms, "Shadow Uniform Buffer"))
+            Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Model Shadow Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[uniforms]),
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            }))
         } else {
             None
         };
-
+        
         let mesh_data = self.prepare_mesh_data(
             model,
             frame_idx,
@@ -1168,42 +1956,68 @@ impl MD3Renderer {
 
         drop(render_pass);
 
-        if render_shadow {
-            let shadow_pipeline = self.shadow_pipeline.as_ref().unwrap();
-            let mut shadow_pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("Shadow Render Pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: output_view,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Load,
-                        store: StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-                    view: depth_view,
-                    depth_ops: Some(Operations {
-                        load: LoadOp::Load,
-                        store: StoreOp::Store,
+        if render_shadow && !lights.is_empty() {
+            for light_idx in 0..lights.len() {
+                let single_light = &[lights[light_idx]];
+                let shadow_uniforms = self.create_uniforms(
+                    view_proj,
+                    model_matrix,
+                    camera_pos,
+                    single_light,
+                    ambient_light,
+                );
+                
+                let shadow_uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Shadow Uniform Buffer"),
+                    contents: bytemuck::cast_slice(&[shadow_uniforms]),
+                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                });
+                
+                let shadow_mesh_data = self.prepare_mesh_data(
+                    model,
+                    frame_idx,
+                    texture_paths,
+                    &uniform_buffer,
+                    Some(&shadow_uniform_buffer),
+                    true,
+                );
+                
+                let shadow_pipeline = self.shadow_pipeline.as_ref().unwrap();
+                let mut shadow_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("Shadow Render Pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: output_view,
+                        resolve_target: None,
+                        ops: Operations {
+                            load: LoadOp::Load,
+                            store: StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                        view: depth_view,
+                        depth_ops: Some(Operations {
+                            load: LoadOp::Load,
+                            store: StoreOp::Store,
+                        }),
+                        stencil_ops: Some(Operations {
+                            load: if light_idx == 0 { LoadOp::Clear(0) } else { LoadOp::Load },
+                            store: StoreOp::Store,
+                        }),
                     }),
-                    stencil_ops: Some(Operations {
-                        load: LoadOp::Clear(0),
-                        store: StoreOp::Store,
-                    }),
-                }),
-                occlusion_query_set: None,
-                timestamp_writes: None,
-            });
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                });
 
-            shadow_pass.set_pipeline(shadow_pipeline);
-            shadow_pass.set_stencil_reference(0);
+                shadow_pass.set_pipeline(shadow_pipeline);
+                shadow_pass.set_stencil_reference(0);
 
-            for mesh in &mesh_data {
-                if let Some(ref shadow_bind_group) = mesh.shadow_bind_group {
-                    shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
-                    shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    shadow_pass.set_index_buffer(mesh.index_buffer.slice(..), IndexFormat::Uint16);
-                    shadow_pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+                for mesh in &shadow_mesh_data {
+                    if let Some(ref shadow_bind_group) = mesh.shadow_bind_group {
+                        shadow_pass.set_bind_group(0, shadow_bind_group, &[]);
+                        shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        shadow_pass.set_index_buffer(mesh.index_buffer.slice(..), IndexFormat::Uint16);
+                        shadow_pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+                    }
                 }
             }
         }
@@ -1225,70 +2039,76 @@ impl MD3Renderer {
             Mat4,
         )],
     ) {
-        if self.wall_shadow_pipeline.is_none() || models.is_empty() {
+        if self.wall_shadow_pipeline.is_none() || models.is_empty() || lights.is_empty() {
             return;
         }
 
-        let mut all_mesh_data = Vec::new();
+        for light_idx in 0..lights.len() {
+            let single_light = &[lights[light_idx]];
+            let mut all_mesh_data = Vec::new();
 
-        for (model, frame_idx, texture_paths, model_matrix) in models {
-            let uniforms = self.create_uniforms(
-                view_proj,
-                *model_matrix,
-                camera_pos,
-                lights,
-                ambient_light,
-            );
+            for (model, frame_idx, texture_paths, model_matrix) in models {
+                let uniforms = self.create_uniforms(
+                    view_proj,
+                    *model_matrix,
+                    camera_pos,
+                    single_light,
+                    ambient_light,
+                );
 
-            let uniform_buffer = self.create_uniform_buffer(&uniforms, "Wall Shadow Uniform Buffer");
+                let uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Wall Shadow Uniform Buffer"),
+                    contents: bytemuck::cast_slice(&[uniforms]),
+                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                });
 
-            let mesh_data = self.prepare_mesh_data(
-                model,
-                *frame_idx,
-                texture_paths,
-                &uniform_buffer,
-                None,
-                false,
-            );
+                let mesh_data = self.prepare_mesh_data(
+                    model,
+                    *frame_idx,
+                    texture_paths,
+                    &uniform_buffer,
+                    None,
+                    false,
+                );
 
-            all_mesh_data.extend(mesh_data);
-        }
+                all_mesh_data.extend(mesh_data);
+            }
 
-        let wall_shadow_pipeline = self.wall_shadow_pipeline.as_ref().unwrap();
-
-        let mut shadow_pass = encoder.begin_render_pass(&RenderPassDescriptor {
-            label: Some("Wall Shadow Render Pass"),
-            color_attachments: &[Some(RenderPassColorAttachment {
-                view: output_view,
-                resolve_target: None,
-                ops: Operations {
-                    load: LoadOp::Load,
-                    store: StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-                view: depth_view,
-                depth_ops: Some(Operations {
-                    load: LoadOp::Load,
-                    store: StoreOp::Store,
+            let wall_shadow_pipeline = self.wall_shadow_pipeline.as_ref().unwrap();
+            let mut shadow_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Wall Shadow Render Pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: output_view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Load,
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(Operations {
+                        load: LoadOp::Load,
+                        store: StoreOp::Store,
+                    }),
+                    stencil_ops: Some(Operations {
+                        load: if light_idx == 0 { LoadOp::Clear(0) } else { LoadOp::Load },
+                        store: StoreOp::Store,
+                    }),
                 }),
-                stencil_ops: Some(Operations {
-                    load: LoadOp::Clear(0),
-                    store: StoreOp::Store,
-                }),
-            }),
-            occlusion_query_set: None,
-            timestamp_writes: None,
-        });
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
 
-        shadow_pass.set_pipeline(wall_shadow_pipeline);
-        shadow_pass.set_stencil_reference(0);
+            shadow_pass.set_pipeline(wall_shadow_pipeline);
+            shadow_pass.set_stencil_reference(0);
 
-        for mesh in &all_mesh_data {
-            shadow_pass.set_bind_group(0, &mesh.bind_group, &[]);
-            shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            shadow_pass.set_index_buffer(mesh.index_buffer.slice(..), IndexFormat::Uint16);
-            shadow_pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+            for mesh in &all_mesh_data {
+                shadow_pass.set_bind_group(0, &mesh.bind_group, &[]);
+                shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                shadow_pass.set_index_buffer(mesh.index_buffer.slice(..), IndexFormat::Uint16);
+                shadow_pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+            }
         }
     }
 
@@ -1305,28 +2125,44 @@ impl MD3Renderer {
             return;
         }
 
+        struct ParticleRenderData {
+            vertex_buffer: Buffer,
+            index_buffer: Buffer,
+            bind_group: BindGroup,
+        }
+
+        let mut render_data = Vec::new();
+
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct ParticleUniforms {
+            view_proj: [[f32; 4]; 4],
+            model: [[f32; 4]; 4],
+            camera_pos: [f32; 4],
+        }
+
         for (position, size, alpha) in particles {
             let vertices = vec![
                 VertexData {
-                    position: [position.x, position.y, position.z],
+                    position: [0.0, 0.0, 0.0],
                     uv: [0.0, 0.0],
                     color: [1.0, 1.0, 1.0, *alpha],
                     normal: [0.0, 1.0, 0.0],
                 },
                 VertexData {
-                    position: [position.x, position.y, position.z],
+                    position: [0.0, 0.0, 0.0],
                     uv: [1.0, 0.0],
                     color: [1.0, 1.0, 1.0, *alpha],
                     normal: [0.0, 1.0, 0.0],
                 },
                 VertexData {
-                    position: [position.x, position.y, position.z],
+                    position: [0.0, 0.0, 0.0],
                     uv: [1.0, 1.0],
                     color: [1.0, 1.0, 1.0, *alpha],
                     normal: [0.0, 1.0, 0.0],
                 },
                 VertexData {
-                    position: [position.x, position.y, position.z],
+                    position: [0.0, 0.0, 0.0],
                     uv: [0.0, 1.0],
                     color: [1.0, 1.0, 1.0, *alpha],
                     normal: [0.0, 1.0, 0.0],
@@ -1346,15 +2182,7 @@ impl MD3Renderer {
                 usage: BufferUsages::INDEX,
             });
 
-            #[repr(C)]
-            #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-            struct ParticleUniforms {
-                view_proj: [[f32; 4]; 4],
-                model: [[f32; 4]; 4],
-                camera_pos: [f32; 4],
-            }
-
-            let model = Mat4::from_scale(Vec3::splat(*size));
+            let model = Mat4::from_translation(*position) * Mat4::from_scale(Vec3::splat(*size));
             let uniforms = ParticleUniforms {
                 view_proj: view_proj.to_cols_array_2d(),
                 model: model.to_cols_array_2d(),
@@ -1378,33 +2206,42 @@ impl MD3Renderer {
                 ],
             });
 
-            let pipeline = self.particle_pipeline.as_ref().unwrap();
-            let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("Particle Render Pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: output_view,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Load,
-                        store: StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-                    view: depth_view,
-                    depth_ops: Some(Operations {
-                        load: LoadOp::Load,
-                        store: StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                occlusion_query_set: None,
-                timestamp_writes: None,
+            render_data.push(ParticleRenderData {
+                vertex_buffer,
+                index_buffer,
+                bind_group,
             });
+        }
 
-            render_pass.set_pipeline(pipeline);
-            render_pass.set_bind_group(0, &bind_group, &[]);
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            render_pass.set_index_buffer(index_buffer.slice(..), IndexFormat::Uint16);
+        let pipeline = self.particle_pipeline.as_ref().unwrap();
+        let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("Particle Render Pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: output_view,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(Operations {
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+
+        render_pass.set_pipeline(pipeline);
+
+        for data in &render_data {
+            render_pass.set_bind_group(0, &data.bind_group, &[]);
+            render_pass.set_vertex_buffer(0, data.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(data.index_buffer.slice(..), IndexFormat::Uint16);
             render_pass.draw_indexed(0..6, 0, 0..1);
         }
     }
@@ -1423,28 +2260,48 @@ impl MD3Renderer {
             return;
         }
 
+        struct FlameRenderData {
+            vertex_buffer: Buffer,
+            index_buffer: Buffer,
+            bind_group: BindGroup,
+        }
+
+        let mut render_data = Vec::new();
+
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct FlameUniforms {
+            view_proj: [[f32; 4]; 4],
+            model: [[f32; 4]; 4],
+            camera_pos: [f32; 4],
+            time: f32,
+            _padding0: f32,
+            _padding1: f32,
+            _padding2: f32,
+        }
+
         for (position, size) in flames {
             let vertices = vec![
                 VertexData {
-                    position: [position.x, position.y, position.z],
+                    position: [0.0, 0.0, 0.0],
                     uv: [0.0, 0.0],
                     color: [1.0, 1.0, 1.0, 1.0],
                     normal: [0.0, 1.0, 0.0],
                 },
                 VertexData {
-                    position: [position.x, position.y, position.z],
+                    position: [0.0, 0.0, 0.0],
                     uv: [1.0, 0.0],
                     color: [1.0, 1.0, 1.0, 1.0],
                     normal: [0.0, 1.0, 0.0],
                 },
                 VertexData {
-                    position: [position.x, position.y, position.z],
+                    position: [0.0, 0.0, 0.0],
                     uv: [1.0, 1.0],
                     color: [1.0, 1.0, 1.0, 1.0],
                     normal: [0.0, 1.0, 0.0],
                 },
                 VertexData {
-                    position: [position.x, position.y, position.z],
+                    position: [0.0, 0.0, 0.0],
                     uv: [0.0, 1.0],
                     color: [1.0, 1.0, 1.0, 1.0],
                     normal: [0.0, 1.0, 0.0],
@@ -1464,19 +2321,7 @@ impl MD3Renderer {
                 usage: BufferUsages::INDEX,
             });
 
-            #[repr(C)]
-            #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-            struct FlameUniforms {
-                view_proj: [[f32; 4]; 4],
-                model: [[f32; 4]; 4],
-                camera_pos: [f32; 4],
-                time: f32,
-                _padding0: f32,
-                _padding1: f32,
-                _padding2: f32,
-            }
-
-            let model = Mat4::from_scale(Vec3::splat(*size));
+            let model = Mat4::from_translation(*position) * Mat4::from_scale(Vec3::splat(*size));
             let uniforms = FlameUniforms {
                 view_proj: view_proj.to_cols_array_2d(),
                 model: model.to_cols_array_2d(),
@@ -1504,33 +2349,42 @@ impl MD3Renderer {
                 ],
             });
 
-            let pipeline = self.flame_pipeline.as_ref().unwrap();
-            let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("Flame Render Pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: output_view,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Load,
-                        store: StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-                    view: depth_view,
-                    depth_ops: Some(Operations {
-                        load: LoadOp::Load,
-                        store: StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                occlusion_query_set: None,
-                timestamp_writes: None,
+            render_data.push(FlameRenderData {
+                vertex_buffer,
+                index_buffer,
+                bind_group,
             });
+        }
 
-            render_pass.set_pipeline(pipeline);
-            render_pass.set_bind_group(0, &bind_group, &[]);
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            render_pass.set_index_buffer(index_buffer.slice(..), IndexFormat::Uint16);
+        let pipeline = self.flame_pipeline.as_ref().unwrap();
+        let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("Flame Render Pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: output_view,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(Operations {
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+
+        render_pass.set_pipeline(pipeline);
+
+        for data in &render_data {
+            render_pass.set_bind_group(0, &data.bind_group, &[]);
+            render_pass.set_vertex_buffer(0, data.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(data.index_buffer.slice(..), IndexFormat::Uint16);
             render_pass.draw_indexed(0..6, 0, 0..1);
         }
     }

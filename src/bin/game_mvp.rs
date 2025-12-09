@@ -18,7 +18,6 @@ use test_md3_standalone::math::{axis_from_mat3, attach_rotated_entity, orientati
 use test_md3_standalone::md3::MD3Model;
 use test_md3_standalone::renderer::{MD3Renderer, WgpuRenderer};
 
-extern crate rand;
 
 struct Light {
     position: Vec3,
@@ -45,8 +44,8 @@ impl LightingParams {
     fn new() -> Self {
         Self {
             lights: vec![
-                Light::new(Vec3::new(3.0, 1., 2.0), Vec3::new(2.5, 2.5, 2.5), 20.0),
-                Light::new(Vec3::new(1.0, 1.10, 2.0), Vec3::new(0.6, 0.6, 1.0), 1.0),
+                Light::new(Vec3::new(-30.0, 3.0, 12.0), Vec3::new(1.6, 1.6, 1.7), 35.0),
+                Light::new(Vec3::new(9.0, 0.0, 0.0), Vec3::new(20.5, 2.5, 2.5), 5.0),
             ],
             ambient: 0.00015,
         }
@@ -66,9 +65,9 @@ impl Camera {
         }
     }
 
-    fn get_view_proj(&self, aspect: f32, player_x: f32) -> (Mat4, Vec3) {
-        let camera_pos = Vec3::new(player_x, self.height, self.distance);
-        let camera_target = Vec3::new(player_x, self.height * 0.5, 0.0);
+    fn get_view_proj(&self, aspect: f32) -> (Mat4, Vec3) {
+        let camera_pos = Vec3::new(0.0, self.height, self.distance);
+        let camera_target = Vec3::new(0.0, self.height * 0.5, 0.0);
         let view_matrix = Mat4::look_at_rh(camera_pos, camera_target, Vec3::Y);
         let proj_matrix = Mat4::perspective_rh(std::f32::consts::PI / 4.0, aspect, 0.1, 1000.0);
         (proj_matrix * view_matrix, camera_pos)
@@ -157,44 +156,6 @@ impl Rocket {
     }
 }
 
-struct SmokeParticle {
-    position: Vec3,
-    velocity: Vec3,
-    lifetime: f32,
-    max_lifetime: f32,
-    size: f32,
-}
-
-impl SmokeParticle {
-    fn new(position: Vec3) -> Self {
-        let random_offset = Vec3::new(
-            (rand::random::<f32>() - 0.5) * 0.5,
-            (rand::random::<f32>() - 0.5) * 0.5,
-            (rand::random::<f32>() - 0.5) * 0.5,
-        );
-        Self {
-            position,
-            velocity: random_offset,
-            lifetime: 0.0,
-            max_lifetime: 2.5,
-            size: 1.2,
-        }
-    }
-
-    fn update(&mut self, dt: f32) {
-        self.position += self.velocity * dt;
-        self.lifetime += dt;
-        self.size += dt * 1.2;
-    }
-
-    fn is_alive(&self) -> bool {
-        self.lifetime < self.max_lifetime
-    }
-
-    fn alpha(&self) -> f32 {
-        (1.0 - self.lifetime / self.max_lifetime).max(0.0) * 0.7
-    }
-}
 
 struct GameApp {
     window: Option<Arc<Window>>,
@@ -230,9 +191,6 @@ struct GameApp {
     move_right: bool,
     shoot_pressed: bool,
     rockets: Vec<Rocket>,
-    smoke_particles: Vec<SmokeParticle>,
-    last_smoke_spawn: f32,
-    last_debug_log: f32,
 }
 
 impl GameApp {
@@ -272,9 +230,6 @@ impl GameApp {
             move_right: false,
             shoot_pressed: false,
             rockets: Vec::new(),
-            smoke_particles: Vec::new(),
-            last_smoke_spawn: 0.0,
-            last_debug_log: 0.0,
         }
     }
 
@@ -365,6 +320,10 @@ impl GameApp {
     }
 
     fn shoot_rocket(&mut self) {
+        println!("ROCKET SHOT! Position: ({:.2}, {:.2}, {:.2}), Direction: ({:.2}, {:.2}, {:.2}), Total rockets: {}", 
+            self.player.x, 0.5, 0.0,
+            if self.player.facing_right { 1.0 } else { -1.0 }, 0.0, 0.0,
+            self.rockets.len() + 1);
         let muzzle_offset = if self.player.facing_right {
             Vec3::new(1.0, 0.0, 0.0)
         } else {
@@ -377,6 +336,7 @@ impl GameApp {
             Vec3::new(-1.0, 0.0, 0.0)
         };
         self.rockets.push(Rocket::new(rocket_position, direction, 35.0));
+        println!("Rocket created. Active rockets: {}", self.rockets.len());
     }
 }
 
@@ -601,21 +561,6 @@ impl ApplicationHandler for GameApp {
                 }
                 self.rockets.retain(|r| r.active);
 
-                self.last_smoke_spawn += dt;
-                if self.last_smoke_spawn > 0.015 {
-                    for rocket in &self.rockets {
-                        for _ in 0..3 {
-                            self.smoke_particles.push(SmokeParticle::new(rocket.position));
-                        }
-                    }
-                    self.last_smoke_spawn = 0.0;
-                }
-
-                for particle in &mut self.smoke_particles {
-                    particle.update(dt);
-                }
-                self.smoke_particles.retain(|p| p.is_alive());
-
                 let lower_frame = self.player_lower.as_ref()
                     .map(|lower| self.calculate_animation_frame(self.player.is_moving, self.player.animation_time, lower))
                     .unwrap_or(0);
@@ -679,6 +624,8 @@ impl ApplicationHandler for GameApp {
                     });
                 }
 
+                let frame_start = Instant::now();
+                
                 let (width, height) = wgpu_renderer.get_viewport_size();
                 let aspect = width as f32 / height as f32;
 
@@ -690,6 +637,11 @@ impl ApplicationHandler for GameApp {
                 for rocket in &self.rockets {
                     let flame_color = Vec3::new(3.5, 2.0, 0.8);
                     lighting.lights.push(Light::new(rocket.position, flame_color, 12.0));
+                    
+                    let flame_offset = if rocket.velocity.x > 0.0 { -1.2 } else { 1.2 };
+                    let flame_pos = rocket.position + Vec3::new(flame_offset, 0.0, 0.0);
+                    let flash_color = Vec3::new(4.0, 2.5, 1.0);
+                    lighting.lights.push(Light::new(flame_pos, flash_color, 8.0));
                 }
                 
                 let lights: Vec<(Vec3, Vec3, f32)> = lighting.lights.iter()
@@ -722,27 +674,34 @@ impl ApplicationHandler for GameApp {
                 } else {
                     std::f32::consts::PI
                 };
-                let rotation = Mat3::from_rotation_y(facing_angle) * correction;
-                let lower_axis = axis_from_mat3(rotation);
-                let lower_origin = Vec3::new(self.player.x, -13.5, 0.0);
-                let lower_orientation = Orientation {
-                    origin: lower_origin,
+                let game_rotation_y = Mat3::from_rotation_y(facing_angle);
+                let md3_rotation = game_rotation_y * correction;
+                let lower_axis = axis_from_mat3(md3_rotation);
+                
+                let md3_lower_origin = Vec3::ZERO;
+                let md3_lower_orientation = Orientation {
+                    origin: md3_lower_origin,
                     axis: lower_axis,
                 };
-                
-                println!("🎮 Sarge X: {:.2} | Orbb X: 25.0", self.player.x);
 
                 let scale = 0.04;
                 let scale_mat = Mat4::from_scale(Vec3::splat(scale));
+                let ground_y = -1.50;
+                let model_bottom_offset = 0.9;
+                let player_y = ground_y + model_bottom_offset;
+                let game_translation = Mat4::from_translation(Vec3::new(self.player.x, player_y, 0.0));
+                let game_rotation = Mat4::from_mat3(game_rotation_y);
+                let game_transform = game_translation * game_rotation;
 
                 let surface_format = wgpu_renderer.surface_config.format;
 
-                let mut upper_orientation = lower_orientation;
+                let mut upper_orientation = md3_lower_orientation;
                 let mut head_orientation: Option<Orientation> = None;
                 let mut weapon_orientation: Option<Orientation> = None;
 
                 if let Some(ref lower) = self.player_lower {
-                    let model_mat = scale_mat * orientation_to_mat4(&lower_orientation);
+                    let md3_model_mat = scale_mat * orientation_to_mat4(&md3_lower_orientation);
+                    let model_mat = game_transform * md3_model_mat;
                     md3_renderer.render_model(
                         &mut encoder,
                         &view,
@@ -765,13 +724,14 @@ impl ApplicationHandler for GameApp {
                             name.trim_end_matches('\0') == "tag_torso"
                         }) {
                             upper_orientation =
-                                attach_rotated_entity(&lower_orientation, torso_tag);
+                                attach_rotated_entity(&md3_lower_orientation, torso_tag);
                         }
                     }
                 }
 
                 if let Some(ref upper) = self.player_upper {
-                    let model_mat = scale_mat * orientation_to_mat4(&upper_orientation);
+                    let md3_model_mat = scale_mat * orientation_to_mat4(&upper_orientation);
+                    let model_mat = game_transform * md3_model_mat;
                     md3_renderer.render_model(
                         &mut encoder,
                         &view,
@@ -810,7 +770,8 @@ impl ApplicationHandler for GameApp {
                 if let (Some(ref head), Some(head_orient)) =
                     (&self.player_head, head_orientation)
                 {
-                    let model_mat = scale_mat * orientation_to_mat4(&head_orient);
+                    let md3_model_mat = scale_mat * orientation_to_mat4(&head_orient);
+                    let model_mat = game_transform * md3_model_mat;
                     md3_renderer.render_model(
                         &mut encoder,
                         &view,
@@ -831,7 +792,8 @@ impl ApplicationHandler for GameApp {
                 if let (Some(ref weapon), Some(weapon_orient)) =
                     (&self.weapon, weapon_orientation)
                 {
-                    let model_mat = scale_mat * orientation_to_mat4(&weapon_orient);
+                    let md3_model_mat = scale_mat * orientation_to_mat4(&weapon_orient);
+                    let model_mat = game_transform * md3_model_mat;
                     md3_renderer.render_model(
                         &mut encoder,
                         &view,
@@ -849,19 +811,29 @@ impl ApplicationHandler for GameApp {
                     );
                 }
 
-                let player2_rotation = Mat3::from_rotation_y(std::f32::consts::PI) * correction;
-                let player2_lower_axis = axis_from_mat3(player2_rotation);
-                let player2_lower_origin = Vec3::new(25.0, -13.5, 0.0);
-                let player2_lower_orientation = Orientation {
-                    origin: player2_lower_origin,
+                let player2_game_rotation_y = Mat3::from_rotation_y(std::f32::consts::PI);
+                let player2_md3_rotation = player2_game_rotation_y * correction;
+                let player2_lower_axis = axis_from_mat3(player2_md3_rotation);
+                
+                let player2_md3_lower_origin = Vec3::ZERO;
+                let player2_md3_lower_orientation = Orientation {
+                    origin: player2_md3_lower_origin,
                     axis: player2_lower_axis,
                 };
+                
+                let ground_y = -1.50;
+                let model_bottom_offset = 0.6;
+                let player2_y = ground_y + model_bottom_offset;
+                let player2_game_translation = Mat4::from_translation(Vec3::new(10.0, player2_y, 0.0));
+                let player2_game_rotation = Mat4::from_mat3(player2_game_rotation_y);
+                let player2_game_transform = player2_game_translation * player2_game_rotation;
 
-                let mut player2_upper_orientation = player2_lower_orientation;
+                let mut player2_upper_orientation = player2_md3_lower_orientation;
                 let mut player2_head_orientation: Option<Orientation> = None;
 
                 if let Some(ref lower) = self.player2_lower {
-                    let model_mat = scale_mat * orientation_to_mat4(&player2_lower_orientation);
+                    let md3_model_mat = scale_mat * orientation_to_mat4(&player2_md3_lower_orientation);
+                    let model_mat = player2_game_transform * md3_model_mat;
                     md3_renderer.render_model(
                         &mut encoder,
                         &view,
@@ -884,13 +856,14 @@ impl ApplicationHandler for GameApp {
                             name.trim_end_matches('\0') == "tag_torso"
                         }) {
                             player2_upper_orientation =
-                                attach_rotated_entity(&player2_lower_orientation, torso_tag);
+                                attach_rotated_entity(&player2_md3_lower_orientation, torso_tag);
                         }
                     }
                 }
 
                 if let Some(ref upper) = self.player2_upper {
-                    let model_mat = scale_mat * orientation_to_mat4(&player2_upper_orientation);
+                    let md3_model_mat = scale_mat * orientation_to_mat4(&player2_upper_orientation);
+                    let model_mat = player2_game_transform * md3_model_mat;
                     md3_renderer.render_model(
                         &mut encoder,
                         &view,
@@ -921,7 +894,8 @@ impl ApplicationHandler for GameApp {
                 if let (Some(ref head), Some(head_orient)) =
                     (&self.player2_head, player2_head_orientation)
                 {
-                    let model_mat = scale_mat * orientation_to_mat4(&head_orient);
+                    let md3_model_mat = scale_mat * orientation_to_mat4(&head_orient);
+                    let model_mat = player2_game_transform * md3_model_mat;
                     md3_renderer.render_model(
                         &mut encoder,
                         &view,
@@ -939,9 +913,100 @@ impl ApplicationHandler for GameApp {
                     );
                 }
 
-                for rocket in &self.rockets {
-                    if let Some(ref rocket_model) = self.rocket_model {
+
+                let mut shadow_models = Vec::new();
+
+                if let Some(ref lower) = self.player_lower {
+                    let md3_model_mat = scale_mat * orientation_to_mat4(&md3_lower_orientation);
+                    let model_mat = game_transform * md3_model_mat;
+                    shadow_models.push((
+                        lower,
+                        lower_frame,
+                        self.lower_textures.as_slice(),
+                        model_mat,
+                    ));
+                }
+
+                if let Some(ref upper) = self.player_upper {
+                    let md3_model_mat = scale_mat * orientation_to_mat4(&upper_orientation);
+                    let model_mat = game_transform * md3_model_mat;
+                    shadow_models.push((
+                        upper,
+                        upper_frame,
+                        self.upper_textures.as_slice(),
+                        model_mat,
+                    ));
+                }
+
+                if let (Some(ref head), Some(head_orient)) =
+                    (&self.player_head, head_orientation)
+                {
+                    let md3_model_mat = scale_mat * orientation_to_mat4(&head_orient);
+                    let model_mat = game_transform * md3_model_mat;
+                    shadow_models.push((
+                        head,
+                        0,
+                        self.head_textures.as_slice(),
+                        model_mat,
+                    ));
+                }
+
+                if let (Some(ref weapon), Some(weapon_orient)) =
+                    (&self.weapon, weapon_orientation)
+                {
+                    let md3_model_mat = scale_mat * orientation_to_mat4(&weapon_orient);
+                    let model_mat = game_transform * md3_model_mat;
+                    shadow_models.push((
+                        weapon,
+                        0,
+                        self.weapon_textures.as_slice(),
+                        model_mat,
+                    ));
+                }
+
+                if let Some(ref lower) = self.player2_lower {
+                    let md3_model_mat = scale_mat * orientation_to_mat4(&player2_md3_lower_orientation);
+                    let model_mat = player2_game_transform * md3_model_mat;
+                    shadow_models.push((
+                        lower,
+                        0,
+                        self.player2_lower_textures.as_slice(),
+                        model_mat,
+                    ));
+                }
+
+                if let Some(ref upper) = self.player2_upper {
+                    let md3_model_mat = scale_mat * orientation_to_mat4(&player2_upper_orientation);
+                    let model_mat = player2_game_transform * md3_model_mat;
+                    shadow_models.push((
+                        upper,
+                        0,
+                        self.player2_upper_textures.as_slice(),
+                        model_mat,
+                    ));
+                }
+
+                if let (Some(ref head), Some(head_orient)) =
+                    (&self.player2_head, player2_head_orientation)
+                {
+                    let md3_model_mat = scale_mat * orientation_to_mat4(&head_orient);
+                    let model_mat = player2_game_transform * md3_model_mat;
+                    shadow_models.push((
+                        head,
+                        0,
+                        self.player2_head_textures.as_slice(),
+                        model_mat,
+                    ));
+                }
+
+                if let Some(ref rocket_model) = self.rocket_model {
+                    for rocket in &self.rockets {
+                        if !rocket.active {
+                            continue;
+                        }
+                        
                         let rocket_scale = 0.15;
+                        let correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
                         let rocket_rotation = Mat3::from_rotation_y(
                             if rocket.velocity.x > 0.0 { 0.0 } else { std::f32::consts::PI }
                         ) * correction;
@@ -969,84 +1034,6 @@ impl ApplicationHandler for GameApp {
                     }
                 }
 
-                let mut shadow_models = Vec::new();
-
-                if let Some(ref lower) = self.player_lower {
-                    let model_mat = scale_mat * orientation_to_mat4(&lower_orientation);
-                    shadow_models.push((
-                        lower,
-                        lower_frame,
-                        self.lower_textures.as_slice(),
-                        model_mat,
-                    ));
-                }
-
-                if let Some(ref upper) = self.player_upper {
-                    let model_mat = scale_mat * orientation_to_mat4(&upper_orientation);
-                    shadow_models.push((
-                        upper,
-                        upper_frame,
-                        self.upper_textures.as_slice(),
-                        model_mat,
-                    ));
-                }
-
-                if let (Some(ref head), Some(head_orient)) =
-                    (&self.player_head, head_orientation)
-                {
-                    let model_mat = scale_mat * orientation_to_mat4(&head_orient);
-                    shadow_models.push((
-                        head,
-                        0,
-                        self.head_textures.as_slice(),
-                        model_mat,
-                    ));
-                }
-
-                if let (Some(ref weapon), Some(weapon_orient)) =
-                    (&self.weapon, weapon_orientation)
-                {
-                    let model_mat = scale_mat * orientation_to_mat4(&weapon_orient);
-                    shadow_models.push((
-                        weapon,
-                        0,
-                        self.weapon_textures.as_slice(),
-                        model_mat,
-                    ));
-                }
-
-                if let Some(ref lower) = self.player2_lower {
-                    let model_mat = scale_mat * orientation_to_mat4(&player2_lower_orientation);
-                    shadow_models.push((
-                        lower,
-                        0,
-                        self.player2_lower_textures.as_slice(),
-                        model_mat,
-                    ));
-                }
-
-                if let Some(ref upper) = self.player2_upper {
-                    let model_mat = scale_mat * orientation_to_mat4(&player2_upper_orientation);
-                    shadow_models.push((
-                        upper,
-                        0,
-                        self.player2_upper_textures.as_slice(),
-                        model_mat,
-                    ));
-                }
-
-                if let (Some(ref head), Some(head_orient)) =
-                    (&self.player2_head, player2_head_orientation)
-                {
-                    let model_mat = scale_mat * orientation_to_mat4(&head_orient);
-                    shadow_models.push((
-                        head,
-                        0,
-                        self.player2_head_textures.as_slice(),
-                        model_mat,
-                    ));
-                }
-
                 md3_renderer.render_wall_shadows_batch(
                     &mut encoder,
                     &view,
@@ -1058,48 +1045,19 @@ impl ApplicationHandler for GameApp {
                     &shadow_models,
                 );
 
-                let mut flame_positions = Vec::new();
-                for rocket in &self.rockets {
-                    let flame_offset = if rocket.velocity.x > 0.0 { -1.2 } else { 1.2 };
-                    flame_positions.push((rocket.position + Vec3::new(flame_offset, 0.0, 0.0), 3.0));
-                    flame_positions.push((rocket.position + Vec3::new(flame_offset * 0.7, 0.0, 0.0), 2.0));
-                }
+
+                let render_time = frame_start.elapsed();
                 
-                self.last_debug_log += dt;
-                if self.last_debug_log > 0.1 && !self.rockets.is_empty() {
-                    for (i, rocket) in self.rockets.iter().enumerate() {
-                        let flame_offset = if rocket.velocity.x > 0.0 { -1.2 } else { 1.2 };
-                        let flame_pos = rocket.position + Vec3::new(flame_offset, 0.0, 0.0);
-                        println!("🚀 Rocket[{}]: pos={:.2?} | 🔥 Flame: pos={:.2?}", i, rocket.position, flame_pos);
-                    }
-                    self.last_debug_log = 0.0;
-                }
-
-                md3_renderer.render_flames(
-                    &mut encoder,
-                    &view,
-                    depth_view,
-                    view_proj,
-                    camera_pos,
-                    &flame_positions,
-                    now.duration_since(self.start_time).as_secs_f32(),
-                );
-
-                let smoke_data: Vec<(Vec3, f32, f32)> = self.smoke_particles.iter()
-                    .map(|p| (p.position, p.size, p.alpha()))
-                    .collect();
-
-                md3_renderer.render_particles(
-                    &mut encoder,
-                    &view,
-                    depth_view,
-                    view_proj,
-                    camera_pos,
-                    &smoke_data,
-                );
-
                 wgpu_renderer.queue.submit(Some(encoder.finish()));
                 wgpu_renderer.end_frame(frame);
+                
+                let total_time = frame_start.elapsed();
+                if self.frame_count % 60 == 0 {
+                    println!("Frame timing: render={:.2}ms, total={:.2}ms, submit={:.2}ms", 
+                        render_time.as_secs_f64() * 1000.0,
+                        total_time.as_secs_f64() * 1000.0,
+                        (total_time - render_time).as_secs_f64() * 1000.0);
+                }
 
                 if let Some(ref window) = self.window {
                     window.request_redraw();
