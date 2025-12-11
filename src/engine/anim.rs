@@ -7,14 +7,21 @@ pub struct AnimRange {
 }
 
 #[derive(Clone, Debug)]
+pub struct AnimEntry {
+    pub name: String,
+    pub range: AnimRange,
+}
+
+#[derive(Clone, Debug)]
 pub struct AnimConfig {
+    pub entries: Vec<AnimEntry>,
     pub both_death1: AnimRange,
     pub both_dead1: AnimRange,
     pub both_death2: AnimRange,
     pub both_dead2: AnimRange,
     pub both_death3: AnimRange,
     pub both_dead3: AnimRange,
-    pub both_dead3_2: AnimRange, // added to match original
+    pub both_dead3_2: AnimRange,
     pub torso_gesture: AnimRange,
     pub torso_attack: AnimRange,
     pub torso_attack2: AnimRange,
@@ -49,7 +56,7 @@ impl AnimConfig {
     }
 
     pub fn parse_content(content: &str) -> Result<Self, String> {
-        let mut anims: Vec<AnimRange> = Vec::new();
+        let mut entries: Vec<AnimEntry> = Vec::new();
 
         for line in content.lines() {
             let line = line.trim();
@@ -58,70 +65,60 @@ impl AnimConfig {
             }
 
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                if let (Ok(first), Ok(num), Ok(loop_frames), Ok(fps)) = (
-                    parts[0].parse::<usize>(),
-                    parts[1].parse::<usize>(),
-                    parts[2].parse::<usize>(),
-                    parts[3].parse::<usize>(),
-                ) {
-                    let anim_range = AnimRange {
-                        first_frame: first,
-                        num_frames: num,
-                        looping_frames: loop_frames,
-                        fps,
-                    };
-                    anims.push(anim_range);
-                }
+            if parts.len() < 4 {
+                continue;
+            }
+            let parsed = (
+                parts[0].parse::<usize>(),
+                parts[1].parse::<usize>(),
+                parts[2].parse::<usize>(),
+                parts[3].parse::<usize>(),
+            );
+            if let (Ok(first), Ok(num), Ok(loop_frames), Ok(fps)) = parsed {
+                let name = line
+                    .split("//")
+                    .nth(1)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|| format!("ANIM_{}", entries.len()));
+                let range = AnimRange {
+                    first_frame: first,
+                    num_frames: num,
+                    looping_frames: loop_frames,
+                    fps,
+                };
+                entries.push(AnimEntry { name, range });
             }
         }
 
-        if anims.len() < 25 {
-             // Basic fallback if file is incomplete or follows different structure
-             // But usually q3 animation.cfg has ~26 lines
-        }
-        
-        // Q3 convention:
-        // 0-5: deaths
-        // 6: gesture
-        // 7-8: attacks
-        // 9: drop
-        // 10: raise
-        // 11-12: stand
-        // 13: walkcr
-        // 14: walk
-        // 15: run
-        // 16: back
-        // 17: swim
-        // 18: jump
-        // 19: land
-        // 20: jumpb
-        // 21: landb
-        // 22: idle
-        // 23: idlecr
-        // 24: turn
+        let mut ranges: Vec<AnimRange> = entries.iter().map(|e| e.range.clone()).collect();
 
-        // Calculate skip offset for legs
-        let skip = if anims.len() > 13 {
-             if anims[13].first_frame > anims[6].first_frame {
-                 anims[13].first_frame - anims[6].first_frame
-             } else {
-                 0
-             }
+        let skip = if ranges.len() > 13 {
+            if ranges[13].first_frame > ranges[6].first_frame {
+                ranges[13].first_frame - ranges[6].first_frame
+            } else {
+                0
+            }
         } else {
             0
         };
 
-        // Apply offset to legs animations
-        for i in 13..anims.len() {
-            anims[i].first_frame = anims[i].first_frame.saturating_sub(skip);
+        for i in 13..ranges.len() {
+            ranges[i].first_frame = ranges[i].first_frame.saturating_sub(skip);
+        }
+
+        for (entry, range) in entries.iter_mut().zip(ranges.iter()) {
+            entry.range = range.clone();
         }
 
         let get = |i: usize| -> AnimRange {
-            anims.get(i).cloned().unwrap_or(AnimRange { first_frame: 0, num_frames: 1, looping_frames: 0, fps: 10 })
+            ranges
+                .get(i)
+                .cloned()
+                .unwrap_or(AnimRange { first_frame: 0, num_frames: 1, looping_frames: 0, fps: 10 })
         };
 
         Ok(AnimConfig {
+            entries,
             both_death1: get(0),
             both_dead1: get(1),
             both_death2: get(2),
@@ -149,6 +146,13 @@ impl AnimConfig {
             legs_idlecr: get(23),
             legs_turn: get(24),
         })
+    }
+
+    pub fn by_name(&self, name: &str) -> Option<&AnimRange> {
+        self.entries
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(name))
+            .map(|e| &e.range)
     }
 }
 

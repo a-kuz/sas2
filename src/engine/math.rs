@@ -1,5 +1,5 @@
 use glam::{Mat3, Mat4, Vec3, Vec4};
-use crate::md3::Tag;
+use crate::engine::md3::Tag;
 
 #[derive(Clone, Copy)]
 pub struct Frustum {

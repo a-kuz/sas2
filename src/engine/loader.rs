@@ -1,6 +1,6 @@
 use wgpu::{Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, ImageCopyTexture, Origin3d, TextureAspect, ImageDataLayout, TextureViewDescriptor, SamplerDescriptor, FilterMode, AddressMode};
-use crate::renderer::{WgpuRenderer, MD3Renderer, WgpuTexture};
-use crate::md3::MD3Model;
+use crate::engine::renderer::{WgpuRenderer, MD3Renderer, WgpuTexture};
+use crate::engine::md3::MD3Model;
 
 pub fn load_textures_for_model_static(
     wgpu_renderer: &mut WgpuRenderer,

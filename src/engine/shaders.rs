@@ -271,8 +271,8 @@ var model_sampler: sampler;
 fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
     let world_pos = uniforms.model * vec4<f32>(input.position, 1.0);
-    
-    let ground_y = -1.5;
+
+    let ground_y = 0.0;
     let light_pos = uniforms.lights[0].position.xyz;
     let light_to_vertex = world_pos.xyz - light_pos;
     let t = (ground_y - light_pos.y) / light_to_vertex.y;
@@ -359,7 +359,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let wall_z = -3.0;
     let light_pos = uniforms.lights[0].position.xyz;
     let light_to_vertex = world_pos.xyz - light_pos;
-    
+
     if (abs(light_to_vertex.z) < 0.001 || light_to_vertex.z >= 0.0) {
         output.clip_position = vec4<f32>(0.0, 0.0, -10.0, 1.0);
         output.world_pos = vec2<f32>(0.0, 0.0);
@@ -379,8 +379,8 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     }
     
     let shadow_pos_center = light_pos + light_to_vertex * t;
-    
-    let ground_y = -1.50;
+
+    let ground_y = 0.0;
     if (shadow_pos_center.y < ground_y) {
         output.clip_position = vec4<f32>(0.0, 0.0, -10.0, 1.0);
         output.world_pos = vec2<f32>(0.0, 0.0);
@@ -393,7 +393,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let to_shadow = vec2<f32>(shadow_pos_center.x, shadow_pos_center.y) - shadow_center_2d;
     let expand_amount = 0.15;
     let shadow_pos_expanded = shadow_pos_center.xy + normalize(to_shadow) * expand_amount;
-    
+
     if (shadow_pos_expanded.y < ground_y) {
         output.clip_position = vec4<f32>(0.0, 0.0, -10.0, 1.0);
         output.world_pos = vec2<f32>(0.0, 0.0);
@@ -412,16 +412,16 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let dist_to_light = length(input.world_pos - input.light_pos_2d);
-    let max_shadow_dist = 85.0;
-    let soft_edge_width = 2.0;
-    
+    let max_shadow_dist = 25.0;
+    let soft_edge_width = 5.0;
+
     let distance_falloff = smoothstep(max_shadow_dist, max_shadow_dist - soft_edge_width, dist_to_light);
-    
+
     let edge_dist = length(input.vertex_to_center);
     let edge_softness = smoothstep(0.3, 0.0, edge_dist);
-    
+
     let shadow_alpha = 1.3 * distance_falloff * (0.6 + 0.4 * edge_softness);
-    
+
     return vec4<f32>(0.0, 0.0, 0.0, shadow_alpha);
 }
 "#;
@@ -489,7 +489,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let wall_bottom = -1.5;
+    let wall_bottom = 0.0;
     let wall_height = 50.0;
     let curb_height = 0.8;
     let curb_start = wall_bottom;
@@ -691,5 +691,189 @@ fn vs_main(input: VertexInput, instance: InstanceInput) -> VertexOutput {
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let tex_color = textureSample(flame_texture, flame_sampler, input.uv);
     return vec4<f32>(tex_color.rgb, tex_color.a);
+}
+"#;
+
+pub const DEBUG_LIGHT_SPHERE_SHADER: &str = r#"
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) normal: vec3<f32>,
+}
+
+struct InstanceInput {
+    @location(4) position_radius: vec4<f32>,
+    @location(5) light_color: vec4<f32>,
+}
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) world_pos: vec3<f32>,
+    @location(1) light_color: vec4<f32>,
+    @location(2) radius: f32,
+}
+
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+    camera_pos: vec4<f32>,
+}
+
+@group(0) @binding(0)
+var<uniform> uniforms: Uniforms;
+
+@vertex
+fn vs_main(input: VertexInput, instance: InstanceInput) -> VertexOutput {
+    var output: VertexOutput;
+    let instance_pos = instance.position_radius.xyz;
+    let instance_radius = instance.position_radius.w;
+    
+    let world_pos = instance_pos + input.position * instance_radius;
+    
+    output.clip_position = uniforms.view_proj * vec4<f32>(world_pos, 1.0);
+    output.world_pos = world_pos;
+    output.light_color = instance.light_color;
+    output.radius = instance_radius;
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(input.light_color.rgb, 0.6);
+}
+"#;
+
+pub const DEBUG_LIGHT_RAY_SHADER: &str = r#"
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) color: vec4<f32>,
+}
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+}
+
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+}
+
+@group(0) @binding(0)
+var<uniform> uniforms: Uniforms;
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    output.clip_position = uniforms.view_proj * vec4<f32>(input.position, 1.0);
+    output.color = input.color;
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return input.color;
+}
+"#;
+
+pub const SHADOW_VOLUME_SHADER: &str = r#"
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) extrude_dir: vec3<f32>,
+}
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+}
+
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+    light_pos: vec4<f32>,
+    extrude_distance: f32,
+    _padding0: f32,
+    _padding1: f32,
+    _padding2: f32,
+}
+
+@group(0) @binding(0)
+var<uniform> uniforms: Uniforms;
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    
+    let extrude_amount = length(input.extrude_dir);
+    
+    var world_pos: vec3<f32>;
+    if (extrude_amount > 0.5) {
+        let light_to_vertex = input.position - uniforms.light_pos.xyz;
+        let extruded_pos = input.position + normalize(light_to_vertex) * uniforms.extrude_distance;
+        world_pos = extruded_pos;
+    } else {
+        world_pos = input.position;
+    }
+    
+    output.clip_position = uniforms.view_proj * vec4<f32>(world_pos, 1.0);
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+}
+"#;
+
+pub const SHADOW_APPLY_SHADER: &str = r#"
+struct VertexInput {
+    @location(0) position: vec2<f32>,
+}
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+}
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    output.clip_position = vec4<f32>(input.position, 0.0, 1.0);
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 0.0, 0.75);
+}
+"#;
+
+pub const SHADOW_PLANAR_SHADER: &str = r#"
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+}
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+}
+
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+    light_pos: vec4<f32>,
+    extrude_distance: f32,
+    _padding0: f32,
+    _padding1: f32,
+    _padding2: f32,
+}
+
+@group(0) @binding(0)
+var<uniform> uniforms: Uniforms;
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    output.clip_position = uniforms.view_proj * vec4<f32>(input.position, 1.0);
+    return output;
+}
+
+@fragment
+fn fs_main(_input: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 0.0, 0.75);
 }
 "#;

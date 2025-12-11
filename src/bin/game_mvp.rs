@@ -12,354 +12,17 @@ use winit::{
     window::Window,
 };
 
-use test_md3_standalone::anim::AnimConfig;
-use test_md3_standalone::loader::{load_textures_for_model_static, load_weapon_textures_static, load_rocket_textures_static};
-use test_md3_standalone::math::{axis_from_mat3, attach_rotated_entity, orientation_to_mat4, Orientation, Frustum};
-use test_md3_standalone::md3::MD3Model;
-use test_md3_standalone::renderer::{MD3Renderer, WgpuRenderer};
+use sas2::engine::anim::{AnimConfig, AnimRange};
+use sas2::engine::loader::{load_textures_for_model_static, load_weapon_textures_static, load_rocket_textures_static};
+use sas2::engine::math::{axis_from_mat3, attach_rotated_entity, orientation_to_mat4, Orientation, Frustum};
+use sas2::engine::md3::MD3Model;
+use sas2::engine::renderer::{MD3Renderer, WgpuRenderer};
 
-
-struct Light {
-    position: Vec3,
-    color: Vec3,
-    radius: f32,
-    flicker_enabled: bool,
-    flicker_frequency: f32,
-    flicker_intensity: f32,
-    flicker_phase: f32,
-    flicker_randomized: bool,
-}
-
-impl Light {
-    fn new(position: Vec3, color: Vec3, radius: f32) -> Self {
-        Self {
-            position,
-            color,
-            radius,
-            flicker_enabled: false,
-            flicker_frequency: 0.0,
-            flicker_intensity: 0.0,
-            flicker_phase: 0.0,
-            flicker_randomized: false,
-        }
-    }
-
-    fn with_flicker(
-        position: Vec3,
-        color: Vec3,
-        radius: f32,
-        frequency: f32,
-        intensity: f32,
-        phase: f32,
-    ) -> Self {
-        Self {
-            position,
-            color,
-            radius,
-            flicker_enabled: true,
-            flicker_frequency: frequency,
-            flicker_intensity: intensity,
-            flicker_phase: phase,
-            flicker_randomized: false,
-        }
-    }
-
-    fn with_randomized_flicker(
-        position: Vec3,
-        color: Vec3,
-        radius: f32,
-        frequency: f32,
-        intensity: f32,
-    ) -> Self {
-        Self {
-            position,
-            color,
-            radius,
-            flicker_enabled: true,
-            flicker_frequency: frequency,
-            flicker_intensity: intensity,
-            flicker_phase: 0.0,
-            flicker_randomized: true,
-        }
-    }
-
-    fn get_color_at_time(&self, time: f32) -> Vec3 {
-        if !self.flicker_enabled {
-            return self.color;
-        }
-
-        let flicker_value = if self.flicker_randomized {
-            let seed = self.position.x * 73.0 + self.position.y * 97.0 + self.position.z * 113.0;
-            let time_quantized = (time * self.flicker_frequency).floor();
-            let hash = ((time_quantized + seed) * 12.9898).sin() * 43758.5453;
-            let random = (hash - hash.floor()) * 2.0 - 1.0;
-            let smooth = (time * self.flicker_frequency * 2.0 * std::f32::consts::PI).sin() * 0.3;
-            (random + smooth).clamp(-1.0, 1.0)
-        } else {
-            (time * self.flicker_frequency * 2.0 * std::f32::consts::PI + self.flicker_phase).sin()
-        };
-        
-        let normalized = (flicker_value + 1.0) * 0.5;
-        let flicker_factor = 1.0 - self.flicker_intensity * (1.0 - normalized);
-        self.color * flicker_factor.max(0.0)
-    }
-}
-
-struct LightingParams {
-    lights: Vec<Light>,
-    ambient: f32,
-}
-
-impl LightingParams {
-    fn new() -> Self {
-        Self {
-            lights: vec![
-                Light::new(Vec3::new(-10.0, 9.0, 12.0), Vec3::new(1.6, 1.6, 2.7), 135.0),
-                Light::with_flicker(
-                    Vec3::new(9.0, 1.0, 0.0),
-                    Vec3::new(20.5, 2.5, 2.5),
-                    5.0,
-                    8.0,
-                    0.4,
-                    0.0,
-                ),
-                Light::with_randomized_flicker(
-                    Vec3::new(-15.0, 2.0, -8.0),
-                    Vec3::new(15.0, 12.0, 8.0),
-                    8.0,
-                    10.0,
-                    0.5,
-                ),
-            ],
-            ambient: 0.00015,
-        }
-    }
-}
-
-struct Camera {
-    x: f32,
-    y: f32,
-    z: f32,
-}
-
-impl Camera {
-    fn new() -> Self {
-        Self {
-            x: 0.0,
-            y: 5.0,
-            z: 35.0,
-        }
-    }
-
-
-    fn get_view_proj(&self, aspect: f32) -> (Mat4, Vec3) {
-        let camera_pos = Vec3::new(self.x, self.y, self.z);
-        let camera_target = Vec3::new(self.x, self.y, 0.0);
-        let view_matrix = Mat4::look_at_rh(camera_pos, camera_target, Vec3::Y);
-        let proj_matrix = Mat4::perspective_rh(std::f32::consts::PI / 4.0, aspect, 0.1, 1000.0);
-        (proj_matrix * view_matrix, camera_pos)
-    }
-}
-
-struct Player {
-    x: f32,
-    vx: f32,
-    facing_right: bool,
-    is_moving: bool,
-    animation_time: f32,
-}
-
-impl Player {
-    fn new() -> Self {
-        Self {
-            x: 0.0,
-            vx: 0.0,
-            facing_right: true,
-            is_moving: false,
-            animation_time: 0.0,
-        }
-    }
-
-    fn update(&mut self, dt: f32, move_left: bool, move_right: bool) {
-        let accel = 100.0;
-        let friction = 10.0;
-        let max_speed = 15.0;
-
-        if move_left && !move_right {
-            self.vx -= accel * dt;
-            self.facing_right = false;
-            self.is_moving = true;
-        } else if move_right && !move_left {
-            self.vx += accel * dt;
-            self.facing_right = true;
-            self.is_moving = true;
-        } else {
-            self.is_moving = false;
-        }
-
-        self.vx -= self.vx * friction * dt;
-        self.vx = self.vx.clamp(-max_speed, max_speed);
-
-        if self.vx.abs() < 0.01 {
-            self.vx = 0.0;
-        }
-
-        self.x += self.vx * dt;
-
-        if self.is_moving {
-            self.animation_time += dt;
-        }
-    }
-}
-
-struct Rocket {
-    position: Vec3,
-    previous_position: Vec3,
-    velocity: Vec3,
-    lifetime: f32,
-    max_lifetime: f32,
-    active: bool,
-    trail_time: f32,
-}
-
-impl Rocket {
-    fn new(position: Vec3, direction: Vec3, speed: f32, frustum: &Frustum) -> Self {
-        let velocity = direction.normalize() * speed;
-        let max_lifetime = frustum.estimate_visibility_time(position, velocity, 0.5);
-        
-        Self {
-            position,
-            previous_position: position,
-            velocity,
-            lifetime: 0.0,
-            max_lifetime,
-            active: true,
-            trail_time: 0.0,
-        }
-    }
-
-    fn update(&mut self, dt: f32, frustum: &Frustum) {
-        if !self.active {
-            return;
-        }
-
-        self.previous_position = self.position;
-        self.position += self.velocity * dt;
-        self.lifetime += dt;
-        self.trail_time += dt;
-
-        if self.lifetime > self.max_lifetime {
-            self.active = false;
-            return;
-        }
-
-        if !frustum.contains_sphere(self.position, 0.5) {
-            self.active = false;
-        }
-    }
-    
-    fn is_visible(&self, frustum: &Frustum) -> bool {
-        frustum.contains_sphere(self.position, 0.5)
-    }
-}
-
-struct SmokeParticle {
-    position: Vec3,
-    lifetime: f32,
-    max_lifetime: f32,
-    size: f32,
-    initial_size: f32,
-    start_time: f32,
-}
-
-impl SmokeParticle {
-    fn new(position: Vec3, start_time: f32) -> Self {
-        let scale = 0.04;
-        let initial_size = 24.0 * scale * 0.5;
-        Self {
-            position,
-            lifetime: 0.0,
-            max_lifetime: 2.0,
-            size: initial_size,
-            initial_size,
-            start_time,
-        }
-    }
-
-    fn update(&mut self, dt: f32, current_time: f32) -> bool {
-        let elapsed = current_time - self.start_time;
-        self.lifetime = elapsed;
-        
-        let life_ratio = self.lifetime / self.max_lifetime;
-        if life_ratio >= 1.0 {
-            return false;
-        }
-        
-        let size_growth = 1.0 + life_ratio * 1.5;
-        self.size = self.initial_size * size_growth;
-        
-        true
-    }
-
-    fn get_alpha(&self) -> f32 {
-        let life_ratio = self.lifetime / self.max_lifetime;
-        if life_ratio >= 1.0 {
-            return 0.0;
-        }
-        
-        if life_ratio < 0.1 {
-            life_ratio / 0.1 * 0.33
-        } else {
-            let fade_start = 0.7;
-            let fade_end = 1.0;
-            if life_ratio < fade_start {
-                0.33
-            } else {
-                0.33 * (1.0 - (life_ratio - fade_start) / (fade_end - fade_start)).max(0.0)
-            }
-        }
-    }
-}
-
-struct FlameParticle {
-    position: Vec3,
-    lifetime: f32,
-    max_lifetime: f32,
-    size: f32,
-    texture_index: u32,
-}
-
-impl FlameParticle {
-    fn new(position: Vec3, texture_index: u32) -> Self {
-        Self {
-            position,
-            lifetime: 0.0,
-            max_lifetime: 0.15,
-            size: 0.3,
-            texture_index,
-        }
-    }
-
-    fn update(&mut self, dt: f32, rocket_velocity: Vec3) -> bool {
-        self.lifetime += dt;
-        let life_ratio = self.lifetime / self.max_lifetime;
-        
-        let vel_len = rocket_velocity.length();
-        let dir = if vel_len > 0.001 {
-            -rocket_velocity / vel_len
-        } else {
-            Vec3::new(-1.0, 0.0, 0.0)
-        };
-        
-        self.position += rocket_velocity * dt * 0.3 + dir * 0.5 * dt;
-        
-        let size_curve = 1.0 - life_ratio * 0.5;
-        self.size = 0.3 * size_curve;
-        
-        self.lifetime < self.max_lifetime
-    }
-}
-
+use sas2::game::world::World;
+use sas2::game::camera::Camera;
+use sas2::game::lighting::{LightingParams, Light};
+// use sas2::game::player::Player;
+use sas2::game::weapon::Rocket;
 
 struct PlayerModel {
     lower: Option<MD3Model>,
@@ -371,38 +34,6 @@ struct PlayerModel {
     head_textures: Vec<Option<String>>,
     weapon_textures: Vec<Option<String>>,
     anim_config: Option<AnimConfig>,
-}
-
-struct GameApp {
-    window: Option<Arc<Window>>,
-    wgpu_renderer: Option<WgpuRenderer>,
-    md3_renderer: Option<MD3Renderer>,
-    player_model: PlayerModel,
-    player2_model: PlayerModel,
-    rocket_model: Option<MD3Model>,
-    rocket_textures: Vec<Option<String>>,
-    depth_texture: Option<Texture>,
-    depth_view: Option<wgpu::TextureView>,
-    start_time: Instant,
-    last_frame_time: Instant,
-    last_fps_update: Instant,
-    frame_count: u32,
-    fps: f32,
-    player: Player,
-    move_left: bool,
-    move_right: bool,
-    shoot_pressed: bool,
-    rockets: Vec<Rocket>,
-    last_shot_time: f32,
-    smoke_particles: Vec<SmokeParticle>,
-    flame_particles: Vec<FlameParticle>,
-    camera: Camera,
-    camera_move_x_neg: bool,
-    camera_move_x_pos: bool,
-    camera_move_y_neg: bool,
-    camera_move_y_pos: bool,
-    camera_move_z_neg: bool,
-    camera_move_z_pos: bool,
 }
 
 impl PlayerModel {
@@ -421,9 +52,55 @@ impl PlayerModel {
     }
 }
 
+struct GameApp {
+    window: Option<Arc<Window>>,
+    wgpu_renderer: Option<WgpuRenderer>,
+    md3_renderer: Option<MD3Renderer>,
+    player_model: PlayerModel,
+    player2_model: PlayerModel,
+    rocket_model: Option<MD3Model>,
+    rocket_textures: Vec<Option<String>>,
+    depth_texture: Option<Texture>,
+    depth_view: Option<wgpu::TextureView>,
+    start_time: Instant,
+    last_frame_time: Instant,
+    last_fps_update: Instant,
+    frame_count: u32,
+    fps: f32,
+    
+    // World state
+    world: World,
+    local_player_id: u32,
+    
+    // Input state
+    move_left: bool,
+    move_right: bool,
+    jump_pressed: bool,
+    crouch_pressed: bool,
+    shoot_pressed: bool,
+    last_shot_time: f32,
+    is_shooting: bool,
+    shoot_anim_start_time: f32,
+    
+    player2_gesture_start_time: f32,
+    player2_is_gesturing: bool,
+    player2_next_gesture_time: f32,
+    
+    camera: Camera,
+    camera_move_x_neg: bool,
+    camera_move_x_pos: bool,
+    camera_move_y_neg: bool,
+    camera_move_y_pos: bool,
+    camera_move_z_neg: bool,
+    camera_move_z_pos: bool,
+}
+
 impl GameApp {
     fn new() -> Self {
         let now = Instant::now();
+        let mut world = World::new();
+        let local_player_id = world.add_player();
+        
         Self {
             window: None,
             wgpu_renderer: None,
@@ -439,14 +116,23 @@ impl GameApp {
             last_fps_update: now,
             frame_count: 0,
             fps: 0.0,
-            player: Player::new(),
+            
+            world,
+            local_player_id,
+            
             move_left: false,
             move_right: false,
+            jump_pressed: false,
+            crouch_pressed: false,
             shoot_pressed: false,
-            rockets: Vec::new(),
             last_shot_time: 0.0,
-            smoke_particles: Vec::new(),
-            flame_particles: Vec::new(),
+            is_shooting: false,
+            shoot_anim_start_time: 0.0,
+            
+            player2_gesture_start_time: 0.0,
+            player2_is_gesturing: false,
+            player2_next_gesture_time: 5.0,
+            
             camera: Camera::new(),
             camera_move_x_neg: false,
             camera_move_x_pos: false,
@@ -500,12 +186,35 @@ impl GameApp {
             self.frame_count = 0;
             self.last_fps_update = now;
             if let Some(ref window) = self.window {
+                let player_x = self.world.players.get(self.local_player_id as usize).map(|p| p.x).unwrap_or(0.0);
                 window.set_title(&format!(
                     "SAS2 MVP | FPS: {:.0} | X: {:.1}",
-                    self.fps, self.player.x
+                    self.fps, player_x
                 ));
             }
         }
+    }
+
+    fn frame_for_anim(anim: &AnimRange, time: f32, model: &MD3Model) -> usize {
+        let frames_passed = (time * anim.fps as f32).floor() as usize;
+        let max_index = model.header.num_bone_frames as usize;
+        if max_index == 0 {
+            return 0;
+        }
+        if anim.looping_frames == 0 {
+            let last = anim.num_frames.saturating_sub(1);
+            let frame = anim.first_frame + frames_passed.min(last);
+            return frame.min(max_index - 1);
+        }
+        let loop_len = anim.looping_frames.min(anim.num_frames).max(1);
+        if frames_passed < anim.num_frames {
+            let frame = anim.first_frame + frames_passed;
+            return frame.min(max_index - 1);
+        }
+        let loop_start = anim.first_frame + anim.num_frames.saturating_sub(loop_len);
+        let loop_index = (frames_passed - anim.num_frames) % loop_len;
+        let frame = loop_start + loop_index;
+        frame.min(max_index - 1)
     }
 
     fn calculate_legs_frame(
@@ -513,20 +222,30 @@ impl GameApp {
         is_moving: bool,
         animation_time: f32,
         model: &MD3Model,
+        state: sas2::game::player::PlayerState,
+        _is_crouching: bool,
     ) -> usize {
+        use sas2::game::player::PlayerState;
+        
         if let Some(ref config) = anim_config {
-            let anim = if is_moving {
-                &config.legs_run
-            } else {
-                &config.legs_idle
+            let anim = match state {
+                PlayerState::Air => &config.legs_jump,
+                PlayerState::Crouching => {
+                    if is_moving {
+                        &config.legs_walkcr
+                    } else {
+                        &config.legs_idlecr
+                    }
+                }
+                PlayerState::Ground => {
+                    if is_moving {
+                        &config.legs_run
+                    } else {
+                        &config.legs_idle
+                    }
+                }
             };
-            let frame_in_anim = if anim.looping_frames > 0 {
-                ((animation_time * anim.fps as f32) as usize) % anim.looping_frames
-            } else {
-                0
-            };
-            let frame = anim.first_frame + frame_in_anim;
-            frame.min(model.header.num_bone_frames as usize - 1)
+            return Self::frame_for_anim(anim, animation_time, model);
         } else {
             0
         }
@@ -536,41 +255,92 @@ impl GameApp {
         anim_config: &Option<AnimConfig>,
         elapsed_time: f32,
         model: &MD3Model,
+        is_shooting: bool,
+        shoot_anim_time: f32,
     ) -> usize {
         if let Some(ref config) = anim_config {
-            let anim = &config.torso_stand;
-            let frame_in_anim = if anim.looping_frames > 0 {
-                let loop_frames = anim.looping_frames.min(anim.num_frames);
-                ((elapsed_time * anim.fps as f32) as usize) % loop_frames
+            let anim = if is_shooting {
+                &config.torso_attack
             } else {
-                0
+                &config.torso_stand
             };
-            let frame = anim.first_frame + frame_in_anim;
-            frame.min(model.header.num_bone_frames as usize - 1)
+            let time = if is_shooting { shoot_anim_time } else { elapsed_time };
+            return Self::frame_for_anim(anim, time, model);
         } else {
             0
         }
     }
 
-    fn shoot_rocket(&mut self, view_proj: Mat4) {
-        let muzzle_offset = if self.player.facing_right {
-            Vec3::new(1.0, 0.0, 0.0)
+    fn calculate_torso_frame_with_gesture(
+        anim_config: &Option<AnimConfig>,
+        elapsed_time: f32,
+        model: &MD3Model,
+        is_gesturing: bool,
+        gesture_anim_time: f32,
+    ) -> usize {
+        if let Some(ref config) = anim_config {
+            let anim = if is_gesturing {
+                &config.torso_gesture
+            } else {
+                &config.torso_stand
+            };
+            let time = if is_gesturing { gesture_anim_time } else { elapsed_time };
+            return Self::frame_for_anim(anim, time, model);
         } else {
-            Vec3::new(-1.0, 0.0, 0.0)
+            0
+        }
+    }
+
+    fn shoot_rocket(&mut self, view_proj: Mat4, weapon_orientation: Option<Orientation>) {
+        let player = match self.world.players.get(self.local_player_id as usize) {
+            Some(p) => p,
+            None => return,
         };
-        let rocket_position = Vec3::new(self.player.x, 0.5, 0.0) + muzzle_offset;
-        let direction = if self.player.facing_right {
+
+        let rocket_position = if let Some(weapon_orient) = weapon_orientation {
+            let scale = 0.04;
+            let facing_angle = if player.facing_right { 0.0 } else { std::f32::consts::PI };
+            let game_rotation_y = Mat3::from_rotation_y(facing_angle);
+            
+            let ground_y = self.world.map.ground_y;
+            let model_bottom_offset = 0.9;
+            let render_y = ground_y + model_bottom_offset + player.y;
+            let game_translation = Mat4::from_translation(Vec3::new(player.x, render_y, 0.0));
+            let game_rotation = Mat4::from_mat3(game_rotation_y);
+            let game_transform = game_translation * game_rotation;
+            let scale_mat = Mat4::from_scale(Vec3::splat(scale));
+            
+            let barrel_offset = Vec3::new(25.0, 0.0, 5.0);
+            let barrel_local_pos = weapon_orient.origin + 
+                weapon_orient.axis[0] * barrel_offset.x +
+                weapon_orient.axis[1] * barrel_offset.y +
+                weapon_orient.axis[2] * barrel_offset.z;
+            
+            let barrel_scaled = scale_mat.transform_point3(barrel_local_pos);
+            let barrel_world = game_transform.transform_point3(barrel_scaled);
+            
+            barrel_world
+        } else {
+            let ground_y = self.world.map.ground_y;
+            let model_bottom_offset = 0.9;
+            let render_y = ground_y + model_bottom_offset + player.y;
+            Vec3::new(player.x, render_y + 0.5, 0.0)
+        };
+
+        let direction = if player.facing_right {
             Vec3::new(1.0, 0.0, 0.0)
         } else {
             Vec3::new(-1.0, 0.0, 0.0)
         };
         let frustum = Frustum::from_view_proj(view_proj);
-        self.rockets.push(Rocket::new(rocket_position, direction, 10.0, &frustum));
+        self.world.rockets.push(Rocket::new(rocket_position, direction, 10.0, &frustum));
         let time = self.start_time.elapsed().as_secs_f32();
         self.last_shot_time = time;
+        self.is_shooting = true;
+        self.shoot_anim_start_time = time;
     }
 
-    fn find_tag<'a>(tags: &'a [test_md3_standalone::md3::Tag], name: &str) -> Option<&'a test_md3_standalone::md3::Tag> {
+    fn find_tag<'a>(tags: &'a [sas2::engine::md3::Tag], name: &str) -> Option<&'a sas2::engine::md3::Tag> {
         tags.iter().find(|t| {
             let tag_name = std::str::from_utf8(&t.name).unwrap_or("");
             tag_name.trim_end_matches('\0') == name
@@ -598,7 +368,7 @@ impl GameApp {
         let mut shadow_models = Vec::new();
         let mut upper_orientation = lower_orientation;
         let mut head_orientation: Option<Orientation> = None;
-        let mut weapon_orientation: Option<Orientation> = None;
+        let mut weapon_orientation_result: Option<Orientation> = None;
 
         if let Some(ref lower) = player_model.lower {
             let md3_model_mat = scale_mat * orientation_to_mat4(&lower_orientation);
@@ -616,7 +386,7 @@ impl GameApp {
                 camera_pos,
                 lights,
                 ambient,
-                true,
+                false,
             );
             shadow_models.push((lower, lower_frame, player_model.lower_textures.as_slice(), model_mat));
 
@@ -643,7 +413,7 @@ impl GameApp {
                 camera_pos,
                 lights,
                 ambient,
-                true,
+                false,
             );
             shadow_models.push((upper, upper_frame, player_model.upper_textures.as_slice(), model_mat));
 
@@ -653,7 +423,7 @@ impl GameApp {
                 }
                 if include_weapon {
                     if let Some(weapon_tag) = Self::find_tag(tags, "tag_weapon") {
-                        weapon_orientation = Some(attach_rotated_entity(&upper_orientation, weapon_tag));
+                        weapon_orientation_result = Some(attach_rotated_entity(&upper_orientation, weapon_tag));
                     }
                 }
             }
@@ -675,13 +445,13 @@ impl GameApp {
                 camera_pos,
                 lights,
                 ambient,
-                true,
+                false,
             );
             shadow_models.push((head, 0, player_model.head_textures.as_slice(), model_mat));
         }
 
         if include_weapon {
-            if let (Some(ref weapon), Some(weapon_orient)) = (&player_model.weapon, weapon_orientation) {
+            if let (Some(ref weapon), Some(weapon_orient)) = (&player_model.weapon, weapon_orientation_result) {
                 let md3_model_mat = scale_mat * orientation_to_mat4(&weapon_orient);
                 let model_mat = game_transform * md3_model_mat;
                 md3_renderer.render_model(
@@ -697,66 +467,13 @@ impl GameApp {
                     camera_pos,
                     lights,
                     ambient,
-                    true,
+                    false,
                 );
+                shadow_models.push((weapon, 0, player_model.weapon_textures.as_slice(), model_mat));
             }
         }
 
-        (head_orientation, shadow_models)
-    }
-
-    fn update_particles(&mut self, dt: f32, frustum: &Frustum) {
-        let time = self.start_time.elapsed().as_secs_f32();
-        let step = 0.05;
-        
-        for rocket in &self.rockets {
-            if !rocket.active || !rocket.is_visible(frustum) {
-                continue;
-            }
-
-            let start_time = rocket.trail_time - dt;
-            let t_start = ((start_time / step).floor() + 1.0) * step;
-            let t_end = (rocket.trail_time / step).floor() * step;
-            
-            if t_end >= t_start {
-                let mut t = t_start;
-                while t <= t_end {
-                    let time_back = rocket.trail_time - t;
-                    let alpha = if dt > 0.001 { time_back / dt } else { 0.0 };
-                    let alpha = alpha.min(1.0).max(0.0);
-                    let spawn_pos = rocket.previous_position * (1.0 - alpha) + rocket.position * alpha;
-                    
-                    let particle_start_time = time - (rocket.trail_time - t);
-                    self.smoke_particles.push(SmokeParticle::new(spawn_pos, particle_start_time));
-                    
-                    t += step;
-                }
-            }
-
-            let flame_texture = ((rocket.trail_time * 20.0) as u32) % 3;
-            let exhaust_dir = -rocket.velocity.normalize();
-            let flame_pos = rocket.position + exhaust_dir * 0.15;
-            self.flame_particles.push(FlameParticle::new(flame_pos, flame_texture));
-        }
-
-        for particle in &mut self.smoke_particles {
-            if !particle.update(dt, time) {
-                continue;
-            }
-        }
-        self.smoke_particles.retain(|p| {
-            let elapsed = time - p.start_time;
-            elapsed < p.max_lifetime
-        });
-
-        for particle in &mut self.flame_particles {
-            if let Some(rocket) = self.rockets.iter().find(|r| r.active && (r.position - particle.position).length() < 2.0) {
-                particle.update(dt, rocket.velocity);
-            } else {
-                particle.lifetime += dt;
-            }
-        }
-        self.flame_particles.retain(|p| p.lifetime < p.max_lifetime);
+        (weapon_orientation_result, shadow_models)
     }
 }
 
@@ -882,21 +599,15 @@ impl ApplicationHandler for GameApp {
                     match code {
                         KeyCode::KeyA => self.move_left = pressed,
                         KeyCode::KeyD => self.move_right = pressed,
+                        KeyCode::KeyW => self.jump_pressed = pressed,
+                        KeyCode::KeyS => self.crouch_pressed = pressed,
                         KeyCode::KeyQ => self.camera_move_x_neg = pressed,
                         KeyCode::KeyE => self.camera_move_x_pos = pressed,
-                        KeyCode::KeyW => self.camera_move_y_neg = pressed,
-                        KeyCode::KeyS => self.camera_move_y_pos = pressed,
                         KeyCode::KeyR => self.camera_move_z_neg = pressed,
                         KeyCode::KeyF => self.camera_move_z_pos = pressed,
+                        KeyCode::KeyZ => self.camera_move_y_neg = pressed,
+                        KeyCode::KeyX => self.camera_move_y_pos = pressed,
                         KeyCode::Space => {
-                            if pressed && !self.shoot_pressed {
-                                if let Some(ref wgpu_renderer) = self.wgpu_renderer {
-                                    let (width, height) = wgpu_renderer.get_viewport_size();
-                                    let aspect = width as f32 / height as f32;
-                                    let (view_proj, _) = self.camera.get_view_proj(aspect);
-                                    self.shoot_rocket(view_proj);
-                                }
-                            }
                             self.shoot_pressed = pressed;
                         }
                         KeyCode::Escape if pressed => event_loop.exit(),
@@ -910,8 +621,8 @@ impl ApplicationHandler for GameApp {
                 self.last_frame_time = now;
 
                 self.update_fps_counter(now);
-                self.player.update(dt, self.move_left, self.move_right);
 
+                // Update Camera
                 let camera_speed = 20.0;
                 if self.camera_move_x_neg {
                     self.camera.x -= camera_speed * dt;
@@ -932,56 +643,104 @@ impl ApplicationHandler for GameApp {
                     self.camera.z += camera_speed * dt;
                 }
 
-                let elapsed_time = self.start_time.elapsed().as_secs_f32();
-                let lower_frame = self.player_model.lower.as_ref()
-                    .map(|lower| Self::calculate_legs_frame(
-                        &self.player_model.anim_config,
-                        self.player.is_moving,
-                        self.player.animation_time,
-                        lower
-                    ))
-                    .unwrap_or(0);
-
-                let upper_frame = self.player_model.upper.as_ref()
-                    .map(|upper| Self::calculate_torso_frame(
-                        &self.player_model.anim_config,
-                        elapsed_time,
-                        upper
-                    ))
-                    .unwrap_or(0);
-
-                let player2_lower_frame = self.player2_model.lower.as_ref()
-                    .map(|lower| Self::calculate_legs_frame(
-                        &self.player2_model.anim_config,
-                        false,
-                        0.0,
-                        lower
-                    ))
-                    .unwrap_or(0);
-
-                let player2_upper_frame = self.player2_model.upper.as_ref()
-                    .map(|upper| Self::calculate_torso_frame(
-                        &self.player2_model.anim_config,
-                        elapsed_time,
-                        upper
-                    ))
-                    .unwrap_or(0);
-
+                // Update World
                 let (width, height) = if let Some(ref wgpu_renderer) = self.wgpu_renderer {
                     wgpu_renderer.get_viewport_size()
                 } else {
                     return;
                 };
                 let aspect = width as f32 / height as f32;
-                let (view_proj, _) = self.camera.get_view_proj(aspect);
+                let (view_proj, _camera_pos) = self.camera.get_view_proj(aspect);
                 let frustum = Frustum::from_view_proj(view_proj);
 
-                for rocket in &mut self.rockets {
-                    rocket.update(dt, &frustum);
+                if let Some(player) = self.world.players.get_mut(self.local_player_id as usize) {
+                    player.update(dt, self.move_left, self.move_right, self.jump_pressed, self.crouch_pressed, self.world.map.ground_y);
                 }
-                self.rockets.retain(|r| r.active);
+                
+                self.world.update(dt, &frustum);
 
-                self.update_particles(dt, &frustum);
+                // Rendering
+                let player = match self.world.players.get(self.local_player_id as usize) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let player_x = player.x;
+                let player_y = player.y;
+                let player_facing_right = player.facing_right;
+                let player_is_moving = player.is_moving;
+                let player_animation_time = player.animation_time;
+                let player_state = player.state;
+                let player_is_crouching = player.is_crouching;
+
+                let elapsed_time = self.start_time.elapsed().as_secs_f32();
+                let lower_frame = self.player_model.lower.as_ref()
+                    .map(|lower| Self::calculate_legs_frame(
+                        &self.player_model.anim_config,
+                        player_is_moving,
+                        player_animation_time,
+                        lower,
+                        player_state,
+                        player_is_crouching
+                    ))
+                    .unwrap_or(0);
+
+                let shoot_anim_time = elapsed_time - self.shoot_anim_start_time;
+                if self.is_shooting {
+                    if let Some(ref config) = self.player_model.anim_config {
+                        let anim_duration = config.torso_attack.num_frames as f32 / config.torso_attack.fps as f32;
+                        if shoot_anim_time >= anim_duration {
+                            self.is_shooting = false;
+                        }
+                    }
+                }
+
+                let upper_frame = self.player_model.upper.as_ref()
+                    .map(|upper| Self::calculate_torso_frame(
+                        &self.player_model.anim_config,
+                        elapsed_time,
+                        upper,
+                        self.is_shooting,
+                        shoot_anim_time
+                    ))
+                    .unwrap_or(0);
+
+                if elapsed_time >= self.player2_next_gesture_time && !self.player2_is_gesturing {
+                    self.player2_is_gesturing = true;
+                    self.player2_gesture_start_time = elapsed_time;
+                    self.player2_next_gesture_time = elapsed_time + 5.0 + (elapsed_time.sin() * 3.0).abs();
+                }
+
+                if self.player2_is_gesturing {
+                    if let Some(ref config) = self.player2_model.anim_config {
+                        let gesture_time = elapsed_time - self.player2_gesture_start_time;
+                        let gesture_duration = config.torso_gesture.num_frames as f32 / config.torso_gesture.fps as f32;
+                        if gesture_time >= gesture_duration {
+                            self.player2_is_gesturing = false;
+                        }
+                    }
+                }
+
+                let player2_lower_frame = self.player2_model.lower.as_ref()
+                    .map(|lower| Self::calculate_legs_frame(
+                        &self.player2_model.anim_config,
+                        false,
+                        elapsed_time,
+                        lower,
+                        sas2::game::player::PlayerState::Ground,
+                        false
+                    ))
+                    .unwrap_or(0);
+
+                let player2_gesture_time = elapsed_time - self.player2_gesture_start_time;
+                let player2_upper_frame = self.player2_model.upper.as_ref()
+                    .map(|upper| Self::calculate_torso_frame_with_gesture(
+                        &self.player2_model.anim_config,
+                        elapsed_time,
+                        upper,
+                        self.player2_is_gesturing,
+                        player2_gesture_time
+                    ))
+                    .unwrap_or(0);
 
                 let player_model = &self.player_model;
                 let player2_model = &self.player2_model;
@@ -1050,12 +809,13 @@ impl ApplicationHandler for GameApp {
                 let (view_proj, camera_pos) = self.camera.get_view_proj(aspect);
                 let frustum = Frustum::from_view_proj(view_proj);
 
-                let mut lighting = LightingParams::new();
+                // Lighting
+                let lighting = LightingParams::new();
                 let time = self.start_time.elapsed().as_secs_f32();
                 
                 let mut dynamic_lights = Vec::new();
                 
-                for rocket in &self.rockets {
+                for rocket in &self.world.rockets {
                     if !rocket.is_visible(&frustum) {
                         continue;
                     }
@@ -1065,7 +825,7 @@ impl ApplicationHandler for GameApp {
                         rocket.position,
                         flame_color,
                         10.0,
-                        4.0,
+                        41.0,
                         4.3,
                     ));
                     
@@ -1116,8 +876,9 @@ impl ApplicationHandler for GameApp {
                 let scale_mat = Mat4::from_scale(Vec3::splat(scale));
                 let surface_format = wgpu_renderer.surface_config.format;
 
+                // Render Local Player
                 let correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
-                let facing_angle = if self.player.facing_right {
+                let facing_angle = if player_facing_right {
                     0.0
                 } else {
                     std::f32::consts::PI
@@ -1129,14 +890,14 @@ impl ApplicationHandler for GameApp {
                     origin: Vec3::ZERO,
                     axis: lower_axis,
                 };
-                let ground_y = -1.4;
+                let ground_y = self.world.map.ground_y;
                 let model_bottom_offset = 0.9;
-                let player_y = ground_y + model_bottom_offset;
-                let game_translation = Mat4::from_translation(Vec3::new(self.player.x, player_y, 0.0));
+                let render_y = ground_y + model_bottom_offset + player_y;
+                let game_translation = Mat4::from_translation(Vec3::new(player_x, render_y, 0.0));
                 let game_rotation = Mat4::from_mat3(game_rotation_y);
                 let game_transform = game_translation * game_rotation;
 
-                let (_, mut shadow_models) = Self::render_player(
+                let (weapon_orientation, mut shadow_models) = Self::render_player(
                     &mut encoder,
                     &view,
                     depth_view,
@@ -1155,6 +916,8 @@ impl ApplicationHandler for GameApp {
                     true,
                 );
 
+                // Render Player 2 (Static dummy for now, but should ideally come from World)
+                // For MVP refactor, keeping it as static dummy
                 let player2_game_rotation_y = Mat3::from_rotation_y(std::f32::consts::PI);
                 let player2_md3_rotation = player2_game_rotation_y * correction;
                 let player2_lower_axis = axis_from_mat3(player2_md3_rotation);
@@ -1162,7 +925,7 @@ impl ApplicationHandler for GameApp {
                     origin: Vec3::ZERO,
                     axis: player2_lower_axis,
                 };
-                let ground_y = -0.9;
+                let ground_y = self.world.map.ground_y;
                 let model_bottom_offset = 0.9;
                 let player2_y = ground_y + model_bottom_offset;
                 let player2_game_translation = Mat4::from_translation(Vec3::new(10.0, player2_y, 0.0));
@@ -1189,10 +952,11 @@ impl ApplicationHandler for GameApp {
                 );
                 shadow_models.extend(player2_shadow_models);
 
+                let should_shoot = self.shoot_pressed && !self.is_shooting;
 
-
+                // Render Rockets
                 if let Some(rocket_model) = rocket_model {
-                    for rocket in &self.rockets {
+                    for rocket in &self.world.rockets {
                         if !rocket.active || !rocket.is_visible(&frustum) {
                             continue;
                         }
@@ -1226,7 +990,7 @@ impl ApplicationHandler for GameApp {
                     }
                 }
 
-                let smoke_particles: Vec<(Vec3, f32, f32)> = self.smoke_particles.iter()
+                let smoke_particles: Vec<(Vec3, f32, f32)> = self.world.smoke_particles.iter()
                     .map(|p| (p.position, p.size, p.get_alpha()))
                     .collect();
                 
@@ -1239,7 +1003,7 @@ impl ApplicationHandler for GameApp {
                     &smoke_particles,
                 );
 
-                let flame_particles: Vec<(Vec3, f32, u32)> = self.flame_particles.iter()
+                let flame_particles: Vec<(Vec3, f32, u32)> = self.world.flame_particles.iter()
                     .map(|p| (p.position, p.size, p.texture_index))
                     .collect();
                 
@@ -1252,22 +1016,46 @@ impl ApplicationHandler for GameApp {
                     &flame_particles,
                 );
 
-                md3_renderer.render_wall_shadows_batch(
+                let shadow_volume_models: Vec<(&MD3Model, usize, Mat4)> = shadow_models.iter()
+                    .map(|(model, frame, _textures, matrix)| (*model, *frame, *matrix))
+                    .collect();
+
+                md3_renderer.render_planar_shadows(
                     &mut encoder,
                     &view,
                     depth_view,
                     view_proj,
-                    camera_pos,
-                    &static_lights,
-                    lighting.ambient,
-                    &shadow_models,
+                    &shadow_volume_models,
+                    &all_lights,
                 );
 
+                // md3_renderer.render_debug_lights(
+                //     &mut encoder,
+                //     &view,
+                //     depth_view,
+                //     view_proj,
+                //     camera_pos,
+                //     &all_lights,
+                //     surface_format,
+                // );
+
+                // md3_renderer.render_debug_light_rays(
+                //     &mut encoder,
+                //     &view,
+                //     depth_view,
+                //     view_proj,
+                //     &all_lights,
+                //     surface_format,
+                // );
 
                 let render_time = frame_start.elapsed();
                 
                 wgpu_renderer.queue.submit(Some(encoder.finish()));
                 wgpu_renderer.end_frame(frame);
+                
+                if should_shoot {
+                    self.shoot_rocket(view_proj, weapon_orientation);
+                }
                 
                 let total_time = frame_start.elapsed();
                 if self.frame_count % 60 == 0 {
