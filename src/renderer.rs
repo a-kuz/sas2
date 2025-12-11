@@ -83,11 +83,18 @@ pub struct WgpuRenderer {
     pub surface: Surface<'static>,
     pub surface_config: SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
+    logical_size: winit::dpi::PhysicalSize<u32>,
+    pixel_ratio: f64,
 }
 
 impl WgpuRenderer {
     pub async fn new(window: Arc<Window>) -> Result<Self, String> {
-        let size = window.inner_size();
+        let pixel_ratio = 2.0;
+        let logical_size = window.inner_size();
+        let size = winit::dpi::PhysicalSize::new(
+            (logical_size.width as f64 * pixel_ratio) as u32,
+            (logical_size.height as f64 * pixel_ratio) as u32,
+        );
         
         let instance = Instance::new(InstanceDescriptor {
             backends: Backends::all(),
@@ -145,14 +152,21 @@ impl WgpuRenderer {
             surface,
             surface_config,
             size,
+            logical_size,
+            pixel_ratio,
         })
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size;
-            self.surface_config.width = new_size.width;
-            self.surface_config.height = new_size.height;
+            self.logical_size = new_size;
+            let size = winit::dpi::PhysicalSize::new(
+                (new_size.width as f64 * self.pixel_ratio) as u32,
+                (new_size.height as f64 * self.pixel_ratio) as u32,
+            );
+            self.size = size;
+            self.surface_config.width = size.width;
+            self.surface_config.height = size.height;
             self.surface.configure(&self.device, &self.surface_config);
         }
     }
@@ -166,6 +180,10 @@ impl WgpuRenderer {
     }
 
     pub fn get_viewport_size(&self) -> (u32, u32) {
+        (self.logical_size.width, self.logical_size.height)
+    }
+
+    pub fn get_surface_size(&self) -> (u32, u32) {
         (self.size.width, self.size.height)
     }
 }
@@ -176,6 +194,8 @@ struct MeshRenderData {
     num_indices: u32,
     bind_group: BindGroup,
     shadow_bind_group: Option<BindGroup>,
+    uniform_buffer: Arc<Buffer>,
+    shadow_uniform_buffer: Option<Arc<Buffer>>,
 }
 
 #[derive(Hash, PartialEq, Eq, Clone)]
@@ -219,6 +239,18 @@ pub struct MD3Renderer {
     shadow_uniform_buffer_pool: Option<Buffer>,
     ground_uniform_buffer: Option<Buffer>,
     wall_uniform_buffer: Option<Buffer>,
+    particle_quad_vertex_buffer: Option<Buffer>,
+    particle_quad_index_buffer: Option<Buffer>,
+    particle_instance_buffer: Option<Buffer>,
+    flame_instance_buffer: Option<Buffer>,
+    ground_bind_group: Option<BindGroup>,
+    wall_bind_group: Option<BindGroup>,
+    particle_uniform_buffer: Option<Buffer>,
+    particle_bind_group: Option<BindGroup>,
+    flame_uniform_buffer: Option<Buffer>,
+    flame_bind_group: Option<BindGroup>,
+    smoke_texture: Option<WgpuTexture>,
+    flame_texture: Option<WgpuTexture>,
 }
 
 impl MD3Renderer {
@@ -263,6 +295,18 @@ impl MD3Renderer {
             shadow_uniform_buffer_pool: None,
             ground_uniform_buffer: None,
             wall_uniform_buffer: None,
+            particle_quad_vertex_buffer: None,
+            particle_quad_index_buffer: None,
+            particle_instance_buffer: None,
+            flame_instance_buffer: None,
+            ground_bind_group: None,
+            wall_bind_group: None,
+            particle_uniform_buffer: None,
+            particle_bind_group: None,
+            flame_uniform_buffer: None,
+            flame_bind_group: None,
+            smoke_texture: None,
+            flame_texture: None,
         }
     }
 
@@ -385,6 +429,23 @@ impl MD3Renderer {
     }
 
     fn create_particle_bind_group_layout(device: &Device) -> BindGroupLayout {
+        #[repr(C)]
+        struct ParticleUniforms {
+            view_proj: [[f32; 4]; 4],
+            camera_pos: [f32; 4],
+        }
+        #[repr(C)]
+        struct FlameUniforms {
+            view_proj: [[f32; 4]; 4],
+            camera_pos: [f32; 4],
+            time: f32,
+            _padding0: f32,
+            _padding1: f32,
+            _padding2: f32,
+        }
+        let particle_size = std::mem::size_of::<ParticleUniforms>() as u64;
+        let flame_size = std::mem::size_of::<FlameUniforms>() as u64;
+        let max_size = particle_size.max(flame_size);
         device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("Particle Bind Group Layout"),
             entries: &[
@@ -394,8 +455,24 @@ impl MD3Renderer {
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: None,
+                        min_binding_size: std::num::NonZeroU64::new(max_size),
                     },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -797,13 +874,30 @@ impl MD3Renderer {
             },
         };
 
+        let instance_buffer_layout = VertexBufferLayout {
+            array_stride: std::mem::size_of::<[f32; 4]>() as BufferAddress * 2,
+            step_mode: VertexStepMode::Instance,
+            attributes: &[
+                VertexAttribute {
+                    offset: 0,
+                    shader_location: 4,
+                    format: VertexFormat::Float32x4,
+                },
+                VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 4]>() as BufferAddress,
+                    shader_location: 5,
+                    format: VertexFormat::Float32,
+                },
+            ],
+        };
+
         let particle_pipeline = self.device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("Particle Pipeline"),
             layout: Some(&particle_pipeline_layout),
             vertex: VertexState {
                 module: &particle_shader,
                 entry_point: "vs_main",
-                buffers: &[VertexData::desc()],
+                buffers: &[VertexData::desc(), instance_buffer_layout],
                 compilation_options: PipelineCompilationOptions::default(),
             },
             fragment: Some(FragmentState {
@@ -841,13 +935,25 @@ impl MD3Renderer {
             push_constant_ranges: &[],
         });
 
+        let flame_instance_buffer_layout = VertexBufferLayout {
+            array_stride: std::mem::size_of::<[f32; 4]>() as BufferAddress,
+            step_mode: VertexStepMode::Instance,
+            attributes: &[
+                VertexAttribute {
+                    offset: 0,
+                    shader_location: 4,
+                    format: VertexFormat::Float32x4,
+                },
+            ],
+        };
+
         let flame_pipeline = self.device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("Flame Pipeline"),
             layout: Some(&flame_pipeline_layout),
             vertex: VertexState {
                 module: &flame_shader,
                 entry_point: "vs_main",
-                buffers: &[VertexData::desc()],
+                buffers: &[VertexData::desc(), flame_instance_buffer_layout],
                 compilation_options: PipelineCompilationOptions::default(),
             },
             fragment: Some(FragmentState {
@@ -855,7 +961,18 @@ impl MD3Renderer {
                 entry_point: "fs_main",
                 targets: &[Some(ColorTargetState {
                     format: surface_format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
+                    blend: Some(BlendState {
+                        color: BlendComponent {
+                            src_factor: BlendFactor::SrcAlpha,
+                            dst_factor: BlendFactor::One,
+                            operation: BlendOperation::Add,
+                        },
+                        alpha: BlendComponent {
+                            src_factor: BlendFactor::One,
+                            dst_factor: BlendFactor::One,
+                            operation: BlendOperation::Add,
+                        },
+                    }),
                     write_mask: ColorWrites::ALL,
                 })],
                 compilation_options: PipelineCompilationOptions::default(),
@@ -873,6 +990,247 @@ impl MD3Renderer {
         });
 
         self.flame_pipeline = Some(flame_pipeline);
+
+        let quad_vertices = vec![
+            VertexData {
+                position: [-0.5, -0.5, 0.0],
+                uv: [0.0, 0.0],
+                color: [1.0, 1.0, 1.0, 1.0],
+                normal: [0.0, 1.0, 0.0],
+            },
+            VertexData {
+                position: [0.5, -0.5, 0.0],
+                uv: [1.0, 0.0],
+                color: [1.0, 1.0, 1.0, 1.0],
+                normal: [0.0, 1.0, 0.0],
+            },
+            VertexData {
+                position: [0.5, 0.5, 0.0],
+                uv: [1.0, 1.0],
+                color: [1.0, 1.0, 1.0, 1.0],
+                normal: [0.0, 1.0, 0.0],
+            },
+            VertexData {
+                position: [-0.5, 0.5, 0.0],
+                uv: [0.0, 1.0],
+                color: [1.0, 1.0, 1.0, 1.0],
+                normal: [0.0, 1.0, 0.0],
+            },
+        ];
+        let quad_indices: Vec<u16> = vec![0, 1, 2, 0, 2, 3];
+
+        let particle_quad_vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Particle Quad Vertex Buffer"),
+            contents: bytemuck::cast_slice(&quad_vertices),
+            usage: BufferUsages::VERTEX,
+        });
+
+        let particle_quad_index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Particle Quad Index Buffer"),
+            contents: bytemuck::cast_slice(&quad_indices),
+            usage: BufferUsages::INDEX,
+        });
+
+        self.particle_quad_vertex_buffer = Some(particle_quad_vertex_buffer);
+        self.particle_quad_index_buffer = Some(particle_quad_index_buffer);
+
+        let max_particles = 1000;
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct ParticleInstance {
+            position_size: [f32; 4],
+            alpha: f32,
+            _padding: [f32; 3],
+        }
+
+        let particle_instance_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("Particle Instance Buffer"),
+            size: (std::mem::size_of::<ParticleInstance>() * max_particles) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.particle_instance_buffer = Some(particle_instance_buffer);
+
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct FlameInstance {
+            position_size: [f32; 4],
+            direction: [f32; 4],
+        }
+
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct FlameInstanceData {
+            position_size: [f32; 4],
+        }
+
+        let flame_instance_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("Flame Instance Buffer"),
+            size: (std::mem::size_of::<FlameInstanceData>() * max_particles) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.flame_instance_buffer = Some(flame_instance_buffer);
+
+        #[repr(C)]
+        struct ParticleUniforms {
+            view_proj: [[f32; 4]; 4],
+            camera_pos: [f32; 4],
+        }
+
+        #[repr(C)]
+        struct FlameUniforms {
+            view_proj: [[f32; 4]; 4],
+            camera_pos: [f32; 4],
+            time: f32,
+            _padding0: f32,
+            _padding1: f32,
+            _padding2: f32,
+        }
+        let particle_size = std::mem::size_of::<ParticleUniforms>() as u64;
+        let flame_size = std::mem::size_of::<FlameUniforms>() as u64;
+        let max_size = particle_size.max(flame_size);
+        let particle_uniform_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("Particle Uniform Buffer"),
+            size: max_size,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.particle_uniform_buffer = Some(particle_uniform_buffer);
+
+        let flame_uniform_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("Flame Uniform Buffer"),
+            size: max_size,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.flame_uniform_buffer = Some(flame_uniform_buffer);
+
+        if self.smoke_texture.is_none() {
+            self.create_smoke_texture();
+        }
+
+        let smoke_tex = self.smoke_texture.as_ref().unwrap();
+        let particle_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Particle Bind Group"),
+            layout: &self.particle_bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: self.particle_uniform_buffer.as_ref().unwrap().as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(&smoke_tex.view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Sampler(&smoke_tex.sampler),
+                },
+            ],
+        });
+        self.particle_bind_group = Some(particle_bind_group);
+
+        if self.flame_texture.is_none() {
+            self.create_flame_texture();
+        }
+
+        let flame_tex = self.flame_texture.as_ref().unwrap();
+        let flame_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Flame Bind Group"),
+            layout: &self.particle_bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: self.flame_uniform_buffer.as_ref().unwrap().as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(&flame_tex.view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Sampler(&flame_tex.sampler),
+                },
+            ],
+        });
+        self.flame_bind_group = Some(flame_bind_group);
+    }
+
+    pub fn create_flame_texture(&mut self) {
+        let candidates = vec![
+            "q3-resources/models/ammo/rocket/rockflar.png",
+            "q3-resources/models/ammo/rocket/rockflar.tga",
+            "q3-resources/models/ammo/rocket/rockfls1.png",
+            "q3-resources/models/ammo/rocket/rockfls1.tga",
+            "q3-resources/models/ammo/rocket/rockfls2.png",
+            "../q3-resources/models/ammo/rocket/rockflar.png",
+            "../q3-resources/models/ammo/rocket/rockflar.tga",
+            "../q3-resources/models/ammo/rocket/rockfls1.png",
+            "../q3-resources/models/ammo/rocket/rockfls1.tga",
+            "../q3-resources/models/ammo/rocket/rockfls2.png",
+        ];
+
+        let mut texture_loaded = false;
+        for path in candidates {
+            if std::path::Path::new(path).exists() {
+                if let Ok(data) = std::fs::read(path) {
+                    if let Ok(img) = image::load_from_memory(&data) {
+                        let img = img.to_rgba8();
+                        let size = Extent3d {
+                            width: img.width(),
+                            height: img.height(),
+                            depth_or_array_layers: 1,
+                        };
+                        let texture = self.device.create_texture(&TextureDescriptor {
+                            label: Some("Flame Texture"),
+                            size,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: TextureDimension::D2,
+                            format: TextureFormat::Rgba8UnormSrgb,
+                            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+
+                        self.queue.write_texture(
+                            ImageCopyTexture {
+                                texture: &texture,
+                                mip_level: 0,
+                                origin: Origin3d::ZERO,
+                                aspect: TextureAspect::All,
+                            },
+                            &img,
+                            ImageDataLayout {
+                                offset: 0,
+                                bytes_per_row: Some(4 * img.width()),
+                                rows_per_image: Some(img.height()),
+                            },
+                            size,
+                        );
+
+                        let view = texture.create_view(&TextureViewDescriptor::default());
+                        let sampler = self.device.create_sampler(&SamplerDescriptor {
+                            address_mode_u: AddressMode::ClampToEdge,
+                            address_mode_v: AddressMode::ClampToEdge,
+                            address_mode_w: AddressMode::ClampToEdge,
+                            mag_filter: FilterMode::Linear,
+                            min_filter: FilterMode::Linear,
+                            mipmap_filter: FilterMode::Linear,
+                            ..Default::default()
+                        });
+
+                        self.flame_texture = Some(WgpuTexture {
+                            texture,
+                            view,
+                            sampler,
+                        });
+                        texture_loaded = true;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     fn get_or_create_buffers(&mut self, model: &MD3Model, mesh_idx: usize, frame_idx: usize) -> Option<(Arc<Buffer>, Arc<Buffer>, u32)> {
@@ -1095,8 +1453,8 @@ impl MD3Renderer {
         model: &MD3Model,
         frame_idx: usize,
         texture_paths: &[Option<String>],
-        uniform_buffer: &Buffer,
-        shadow_uniform_buffer: Option<&Buffer>,
+        uniform_buffer: Arc<Buffer>,
+        shadow_uniform_buffer: Option<Arc<Buffer>>,
         render_shadow: bool,
     ) -> Vec<MeshRenderData> {
         let mut buffers_vec = Vec::new();
@@ -1120,8 +1478,8 @@ impl MD3Renderer {
             if let Some(texture) = texture {
                 let (bind_group, shadow_bind_group) = self.create_mesh_bind_groups(
                     texture,
-                    uniform_buffer,
-                    shadow_uniform_buffer,
+                    &uniform_buffer,
+                    shadow_uniform_buffer.as_ref().map(|b| b.as_ref()),
                     render_shadow,
                 );
 
@@ -1131,6 +1489,8 @@ impl MD3Renderer {
                     num_indices,
                     bind_group,
                     shadow_bind_group,
+                    uniform_buffer: uniform_buffer.clone(),
+                    shadow_uniform_buffer: shadow_uniform_buffer.clone(),
                 });
             }
         }
@@ -1152,14 +1512,6 @@ impl MD3Renderer {
             self.create_ground_texture();
         }
 
-        let uniforms = self.create_uniforms(
-            view_proj,
-            Mat4::IDENTITY,
-            camera_pos,
-            lights,
-            ambient_light,
-        );
-
         if self.ground_uniform_buffer.is_none() {
             self.ground_uniform_buffer = Some(self.device.create_buffer(&BufferDescriptor {
                 label: Some("Ground Uniform Buffer"),
@@ -1168,28 +1520,40 @@ impl MD3Renderer {
                 mapped_at_creation: false,
             }));
         }
+
+        if self.ground_bind_group.is_none() {
+            let ground_tex = self.ground_texture.as_ref().unwrap();
+            let ground_uniform_buffer = self.ground_uniform_buffer.as_ref().unwrap();
+            self.ground_bind_group = Some(self.device.create_bind_group(&BindGroupDescriptor {
+                label: Some("Ground Bind Group"),
+                layout: &self.ground_bind_group_layout,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: ground_uniform_buffer.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::TextureView(&ground_tex.view),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: BindingResource::Sampler(&ground_tex.sampler),
+                    },
+                ],
+            }));
+        }
+
+        let uniforms = self.create_uniforms(
+            view_proj,
+            Mat4::IDENTITY,
+            camera_pos,
+            lights,
+            ambient_light,
+        );
+
         let ground_uniform_buffer = self.ground_uniform_buffer.as_ref().unwrap();
         self.update_uniform_buffer(&uniforms, ground_uniform_buffer);
-        let ground_tex = self.ground_texture.as_ref().unwrap();
-
-        let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
-            label: Some("Ground Bind Group"),
-            layout: &self.ground_bind_group_layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: ground_uniform_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::TextureView(&ground_tex.view),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: BindingResource::Sampler(&ground_tex.sampler),
-                },
-            ],
-        });
 
         let pipeline = self.ground_pipeline.as_ref().unwrap();
         let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -1215,7 +1579,7 @@ impl MD3Renderer {
         });
 
         render_pass.set_pipeline(pipeline);
-        render_pass.set_bind_group(0, &bind_group, &[]);
+        render_pass.set_bind_group(0, self.ground_bind_group.as_ref().unwrap(), &[]);
         render_pass.set_vertex_buffer(0, self.ground_vertex_buffer.as_ref().unwrap().slice(..));
         render_pass.set_index_buffer(self.ground_index_buffer.as_ref().unwrap().slice(..), IndexFormat::Uint16);
         render_pass.draw_indexed(0..6, 0, 0..1);
@@ -1774,6 +2138,156 @@ impl MD3Renderer {
         }
     }
 
+    fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+        let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    pub fn create_smoke_texture(&mut self) {
+        let candidates = vec![
+            "q3-resources/gfx/misc/smokepuff2b.png",
+            "q3-resources/gfx/misc/smokepuff2b.tga",
+            "q3-resources/gfx/misc/smokepuff3.png",
+            "q3-resources/gfx/misc/smokepuff3.tga",
+            "../q3-resources/gfx/misc/smokepuff2b.png",
+            "../q3-resources/gfx/misc/smokepuff2b.tga",
+            "../q3-resources/gfx/misc/smokepuff3.png",
+            "../q3-resources/gfx/misc/smokepuff3.tga",
+        ];
+
+        let mut texture_loaded = false;
+        for path in candidates {
+            if std::path::Path::new(path).exists() {
+                if let Ok(data) = std::fs::read(path) {
+                    if let Ok(img) = image::load_from_memory(&data) {
+                        let img = img.to_rgba8();
+                        let size = Extent3d {
+                            width: img.width(),
+                            height: img.height(),
+                            depth_or_array_layers: 1,
+                        };
+                        let texture = self.device.create_texture(&TextureDescriptor {
+                            label: Some("Smoke Texture"),
+                            size,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: TextureDimension::D2,
+                            format: TextureFormat::Rgba8Unorm,
+                            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+
+                        self.queue.write_texture(
+                            ImageCopyTexture {
+                                texture: &texture,
+                                mip_level: 0,
+                                origin: Origin3d::ZERO,
+                                aspect: TextureAspect::All,
+                            },
+                            &img,
+                            ImageDataLayout {
+                                offset: 0,
+                                bytes_per_row: Some(4 * img.width()),
+                                rows_per_image: Some(img.height()),
+                            },
+                            size,
+                        );
+
+                        let view = texture.create_view(&TextureViewDescriptor::default());
+                        let sampler = self.device.create_sampler(&SamplerDescriptor {
+                            address_mode_u: AddressMode::ClampToEdge,
+                            address_mode_v: AddressMode::ClampToEdge,
+                            address_mode_w: AddressMode::ClampToEdge,
+                            mag_filter: FilterMode::Linear,
+                            min_filter: FilterMode::Linear,
+                            mipmap_filter: FilterMode::Linear,
+                            ..Default::default()
+                        });
+
+                        self.smoke_texture = Some(WgpuTexture {
+                            texture,
+                            view,
+                            sampler,
+                        });
+                        texture_loaded = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !texture_loaded {
+            let size = 64u32;
+            let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+            let center = size as f32 / 2.0;
+            for y in 0..size {
+                for x in 0..size {
+                    let fx = x as f32;
+                    let fy = y as f32;
+                    let dx = fx - center;
+                    let dy = fy - center;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    let max_dist = center * 0.9;
+                    let normalized_dist = (dist / max_dist).min(1.0);
+                    let alpha = Self::smoothstep(1.0, 0.3, normalized_dist);
+                    let base_color = 0.8;
+                    pixels.push((base_color * 255.0) as u8);
+                    pixels.push((base_color * 255.0) as u8);
+                    pixels.push((base_color * 255.0) as u8);
+                    pixels.push((alpha.min(1.0) * 255.0) as u8);
+                }
+            }
+            let texture = self.device.create_texture(&TextureDescriptor {
+                label: Some("Smoke Texture Fallback"),
+                size: Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8Unorm,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                &pixels,
+                ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * size),
+                    rows_per_image: Some(size),
+                },
+                Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let view = texture.create_view(&TextureViewDescriptor::default());
+            let sampler = self.device.create_sampler(&SamplerDescriptor {
+                address_mode_u: AddressMode::ClampToEdge,
+                address_mode_v: AddressMode::ClampToEdge,
+                address_mode_w: AddressMode::ClampToEdge,
+                mag_filter: FilterMode::Linear,
+                min_filter: FilterMode::Linear,
+                mipmap_filter: FilterMode::Linear,
+                ..Default::default()
+            });
+            self.smoke_texture = Some(WgpuTexture {
+                texture,
+                view,
+                sampler,
+            });
+        }
+    }
+
     pub fn render_wall(
         &mut self,
         encoder: &mut CommandEncoder,
@@ -1804,40 +2318,47 @@ impl MD3Renderer {
                 mapped_at_creation: false,
             }));
         }
+        if self.wall_curb_texture.is_none() {
+            self.create_wall_texture();
+        }
+
+        if self.wall_bind_group.is_none() {
+            let wall_uniform_buffer = self.wall_uniform_buffer.as_ref().unwrap();
+            let wall_tex = self.wall_texture.as_ref().unwrap();
+            let curb_tex = self.wall_curb_texture.as_ref().unwrap_or_else(|| {
+                println!("Error: wall_curb_texture is None, using wall_texture as fallback");
+                wall_tex
+            });
+            self.wall_bind_group = Some(self.device.create_bind_group(&BindGroupDescriptor {
+                label: Some("Wall Bind Group"),
+                layout: &self.wall_bind_group_layout,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: wall_uniform_buffer.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::TextureView(&wall_tex.view),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: BindingResource::Sampler(&wall_tex.sampler),
+                    },
+                    BindGroupEntry {
+                        binding: 3,
+                        resource: BindingResource::TextureView(&curb_tex.view),
+                    },
+                    BindGroupEntry {
+                        binding: 4,
+                        resource: BindingResource::Sampler(&curb_tex.sampler),
+                    },
+                ],
+            }));
+        }
+
         let wall_uniform_buffer = self.wall_uniform_buffer.as_ref().unwrap();
         self.update_uniform_buffer(&uniforms, wall_uniform_buffer);
-        let wall_tex = self.wall_texture.as_ref().unwrap();
-        let curb_tex = self.wall_curb_texture.as_ref().unwrap_or_else(|| {
-            println!("Error: wall_curb_texture is None, using wall_texture as fallback");
-            wall_tex
-        });
-
-        let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
-            label: Some("Wall Bind Group"),
-            layout: &self.wall_bind_group_layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: wall_uniform_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::TextureView(&wall_tex.view),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: BindingResource::Sampler(&wall_tex.sampler),
-                },
-                BindGroupEntry {
-                    binding: 3,
-                    resource: BindingResource::TextureView(&curb_tex.view),
-                },
-                BindGroupEntry {
-                    binding: 4,
-                    resource: BindingResource::Sampler(&curb_tex.sampler),
-                },
-            ],
-        });
 
         let pipeline = self.wall_pipeline.as_ref().unwrap();
         let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -1863,7 +2384,7 @@ impl MD3Renderer {
         });
 
         render_pass.set_pipeline(pipeline);
-        render_pass.set_bind_group(0, &bind_group, &[]);
+        render_pass.set_bind_group(0, self.wall_bind_group.as_ref().unwrap(), &[]);
         render_pass.set_vertex_buffer(0, self.wall_vertex_buffer.as_ref().unwrap().slice(..));
         render_pass.set_index_buffer(self.wall_index_buffer.as_ref().unwrap().slice(..), IndexFormat::Uint16);
         render_pass.draw_indexed(0..6, 0, 0..1);
@@ -1897,18 +2418,18 @@ impl MD3Renderer {
             ambient_light,
         );
 
-        let uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let uniform_buffer = Arc::new(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Model Uniform Buffer"),
             contents: bytemuck::cast_slice(&[uniforms]),
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-        });
+            usage: BufferUsages::UNIFORM,
+        }));
 
         let shadow_uniform_buffer = if render_shadow {
-            Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            Some(Arc::new(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Model Shadow Uniform Buffer"),
                 contents: bytemuck::cast_slice(&[uniforms]),
-                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            }))
+                usage: BufferUsages::UNIFORM,
+            })))
         } else {
             None
         };
@@ -1917,8 +2438,8 @@ impl MD3Renderer {
             model,
             frame_idx,
             texture_paths,
-            &uniform_buffer,
-            shadow_uniform_buffer.as_ref(),
+            uniform_buffer.clone(),
+            shadow_uniform_buffer,
             render_shadow,
         );
 
@@ -1967,18 +2488,18 @@ impl MD3Renderer {
                     ambient_light,
                 );
                 
-                let shadow_uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Shadow Uniform Buffer"),
+                let shadow_buffer = Arc::new(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Model Shadow Uniform Buffer"),
                     contents: bytemuck::cast_slice(&[shadow_uniforms]),
-                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                });
+                    usage: BufferUsages::UNIFORM,
+                }));
                 
                 let shadow_mesh_data = self.prepare_mesh_data(
                     model,
                     frame_idx,
                     texture_paths,
-                    &uniform_buffer,
-                    Some(&shadow_uniform_buffer),
+                    uniform_buffer.clone(),
+                    Some(shadow_buffer),
                     true,
                 );
                 
@@ -2056,17 +2577,17 @@ impl MD3Renderer {
                     ambient_light,
                 );
 
-                let uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Wall Shadow Uniform Buffer"),
+                let uniform_buffer = Arc::new(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Wall Shadow Model Uniform Buffer"),
                     contents: bytemuck::cast_slice(&[uniforms]),
-                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                });
+                    usage: BufferUsages::UNIFORM,
+                }));
 
                 let mesh_data = self.prepare_mesh_data(
                     model,
                     *frame_idx,
                     texture_paths,
-                    &uniform_buffer,
+                    uniform_buffer,
                     None,
                     false,
                 );
@@ -2121,96 +2642,81 @@ impl MD3Renderer {
         camera_pos: Vec3,
         particles: &[(Vec3, f32, f32)],
     ) {
-        if self.particle_pipeline.is_none() || particles.is_empty() {
+        if self.particle_pipeline.is_none() 
+            || self.particle_quad_vertex_buffer.is_none()
+            || self.particle_quad_index_buffer.is_none()
+            || self.particle_instance_buffer.is_none()
+            || self.particle_uniform_buffer.is_none()
+            || particles.is_empty() {
             return;
         }
 
-        struct ParticleRenderData {
-            vertex_buffer: Buffer,
-            index_buffer: Buffer,
-            bind_group: BindGroup,
+        if self.smoke_texture.is_none() {
+            self.create_smoke_texture();
         }
 
-        let mut render_data = Vec::new();
-
-        #[repr(C)]
-        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-        struct ParticleUniforms {
-            view_proj: [[f32; 4]; 4],
-            model: [[f32; 4]; 4],
-            camera_pos: [f32; 4],
-        }
-
-        for (position, size, alpha) in particles {
-            let vertices = vec![
-                VertexData {
-                    position: [0.0, 0.0, 0.0],
-                    uv: [0.0, 0.0],
-                    color: [1.0, 1.0, 1.0, *alpha],
-                    normal: [0.0, 1.0, 0.0],
-                },
-                VertexData {
-                    position: [0.0, 0.0, 0.0],
-                    uv: [1.0, 0.0],
-                    color: [1.0, 1.0, 1.0, *alpha],
-                    normal: [0.0, 1.0, 0.0],
-                },
-                VertexData {
-                    position: [0.0, 0.0, 0.0],
-                    uv: [1.0, 1.0],
-                    color: [1.0, 1.0, 1.0, *alpha],
-                    normal: [0.0, 1.0, 0.0],
-                },
-                VertexData {
-                    position: [0.0, 0.0, 0.0],
-                    uv: [0.0, 1.0],
-                    color: [1.0, 1.0, 1.0, *alpha],
-                    normal: [0.0, 1.0, 0.0],
-                },
-            ];
-            let indices: Vec<u16> = vec![0, 1, 2, 0, 2, 3];
-
-            let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Particle Vertex Buffer"),
-                contents: bytemuck::cast_slice(&vertices),
-                usage: BufferUsages::VERTEX,
-            });
-
-            let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Particle Index Buffer"),
-                contents: bytemuck::cast_slice(&indices),
-                usage: BufferUsages::INDEX,
-            });
-
-            let model = Mat4::from_translation(*position) * Mat4::from_scale(Vec3::splat(*size));
-            let uniforms = ParticleUniforms {
-                view_proj: view_proj.to_cols_array_2d(),
-                model: model.to_cols_array_2d(),
-                camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 0.0],
-            };
-
-            let uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Particle Uniform Buffer"),
-                contents: bytemuck::cast_slice(&[uniforms]),
-                usage: BufferUsages::UNIFORM,
-            });
-
-            let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+        if self.particle_bind_group.is_none() {
+            let smoke_tex = self.smoke_texture.as_ref().unwrap();
+            let particle_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
                 label: Some("Particle Bind Group"),
                 layout: &self.particle_bind_group_layout,
                 entries: &[
                     BindGroupEntry {
                         binding: 0,
-                        resource: uniform_buffer.as_entire_binding(),
+                        resource: self.particle_uniform_buffer.as_ref().unwrap().as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::TextureView(&smoke_tex.view),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: BindingResource::Sampler(&smoke_tex.sampler),
                     },
                 ],
             });
+            self.particle_bind_group = Some(particle_bind_group);
+        }
 
-            render_data.push(ParticleRenderData {
-                vertex_buffer,
-                index_buffer,
-                bind_group,
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct ParticleUniforms {
+            view_proj: [[f32; 4]; 4],
+            camera_pos: [f32; 4],
+        }
+
+        let uniforms = ParticleUniforms {
+            view_proj: view_proj.to_cols_array_2d(),
+            camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 0.0],
+        };
+
+        if let Some(ref uniform_buffer) = self.particle_uniform_buffer {
+            self.queue.write_buffer(uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        }
+
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct ParticleInstance {
+            position_size: [f32; 4],
+            alpha: f32,
+            _padding: [f32; 3],
+        }
+
+        let mut instance_data: Vec<ParticleInstance> = Vec::with_capacity(particles.len());
+        for (position, size, alpha) in particles {
+            instance_data.push(ParticleInstance {
+                position_size: [position.x, position.y, position.z, *size],
+                alpha: *alpha,
+                _padding: [0.0; 3],
             });
+        }
+
+        if !instance_data.is_empty() {
+            self.queue.write_buffer(
+                self.particle_instance_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(&instance_data),
+            );
         }
 
         let pipeline = self.particle_pipeline.as_ref().unwrap();
@@ -2237,13 +2743,11 @@ impl MD3Renderer {
         });
 
         render_pass.set_pipeline(pipeline);
-
-        for data in &render_data {
-            render_pass.set_bind_group(0, &data.bind_group, &[]);
-            render_pass.set_vertex_buffer(0, data.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(data.index_buffer.slice(..), IndexFormat::Uint16);
-            render_pass.draw_indexed(0..6, 0, 0..1);
-        }
+        render_pass.set_bind_group(0, self.particle_bind_group.as_ref().unwrap(), &[]);
+        render_pass.set_vertex_buffer(0, self.particle_quad_vertex_buffer.as_ref().unwrap().slice(..));
+        render_pass.set_vertex_buffer(1, self.particle_instance_buffer.as_ref().unwrap().slice(..));
+        render_pass.set_index_buffer(self.particle_quad_index_buffer.as_ref().unwrap().slice(..), IndexFormat::Uint16);
+        render_pass.draw_indexed(0..6, 0, 0..particles.len() as u32);
     }
 
     pub fn render_flames(
@@ -2253,107 +2757,80 @@ impl MD3Renderer {
         depth_view: &TextureView,
         view_proj: Mat4,
         camera_pos: Vec3,
-        flames: &[(Vec3, f32)],
-        time: f32,
+        flames: &[(Vec3, f32, u32)],
     ) {
-        if self.flame_pipeline.is_none() || flames.is_empty() {
+        if self.flame_pipeline.is_none()
+            || self.particle_quad_vertex_buffer.is_none()
+            || self.particle_quad_index_buffer.is_none()
+            || self.flame_instance_buffer.is_none()
+            || self.flame_uniform_buffer.is_none()
+            || self.flame_bind_group.is_none()
+            || flames.is_empty() {
             return;
         }
 
-        struct FlameRenderData {
-            vertex_buffer: Buffer,
-            index_buffer: Buffer,
-            bind_group: BindGroup,
+        if self.flame_texture.is_none() {
+            self.create_flame_texture();
         }
 
-        let mut render_data = Vec::new();
-
-        #[repr(C)]
-        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-        struct FlameUniforms {
-            view_proj: [[f32; 4]; 4],
-            model: [[f32; 4]; 4],
-            camera_pos: [f32; 4],
-            time: f32,
-            _padding0: f32,
-            _padding1: f32,
-            _padding2: f32,
-        }
-
-        for (position, size) in flames {
-            let vertices = vec![
-                VertexData {
-                    position: [0.0, 0.0, 0.0],
-                    uv: [0.0, 0.0],
-                    color: [1.0, 1.0, 1.0, 1.0],
-                    normal: [0.0, 1.0, 0.0],
-                },
-                VertexData {
-                    position: [0.0, 0.0, 0.0],
-                    uv: [1.0, 0.0],
-                    color: [1.0, 1.0, 1.0, 1.0],
-                    normal: [0.0, 1.0, 0.0],
-                },
-                VertexData {
-                    position: [0.0, 0.0, 0.0],
-                    uv: [1.0, 1.0],
-                    color: [1.0, 1.0, 1.0, 1.0],
-                    normal: [0.0, 1.0, 0.0],
-                },
-                VertexData {
-                    position: [0.0, 0.0, 0.0],
-                    uv: [0.0, 1.0],
-                    color: [1.0, 1.0, 1.0, 1.0],
-                    normal: [0.0, 1.0, 0.0],
-                },
-            ];
-            let indices: Vec<u16> = vec![0, 1, 2, 0, 2, 3];
-
-            let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Flame Vertex Buffer"),
-                contents: bytemuck::cast_slice(&vertices),
-                usage: BufferUsages::VERTEX,
-            });
-
-            let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Flame Index Buffer"),
-                contents: bytemuck::cast_slice(&indices),
-                usage: BufferUsages::INDEX,
-            });
-
-            let model = Mat4::from_translation(*position) * Mat4::from_scale(Vec3::splat(*size));
-            let uniforms = FlameUniforms {
-                view_proj: view_proj.to_cols_array_2d(),
-                model: model.to_cols_array_2d(),
-                camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 0.0],
-                time,
-                _padding0: 0.0,
-                _padding1: 0.0,
-                _padding2: 0.0,
-            };
-
-            let uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Flame Uniform Buffer"),
-                contents: bytemuck::cast_slice(&[uniforms]),
-                usage: BufferUsages::UNIFORM,
-            });
-
-            let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+        if self.flame_bind_group.is_none() && self.flame_texture.is_some() {
+            let flame_tex = self.flame_texture.as_ref().unwrap();
+            let flame_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
                 label: Some("Flame Bind Group"),
                 layout: &self.particle_bind_group_layout,
                 entries: &[
                     BindGroupEntry {
                         binding: 0,
-                        resource: uniform_buffer.as_entire_binding(),
+                        resource: self.flame_uniform_buffer.as_ref().unwrap().as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::TextureView(&flame_tex.view),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: BindingResource::Sampler(&flame_tex.sampler),
                     },
                 ],
             });
+            self.flame_bind_group = Some(flame_bind_group);
+        }
 
-            render_data.push(FlameRenderData {
-                vertex_buffer,
-                index_buffer,
-                bind_group,
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct FlameUniforms {
+            view_proj: [[f32; 4]; 4],
+            camera_pos: [f32; 4],
+        }
+
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct FlameInstance {
+            position_size: [f32; 4],
+        }
+
+        let uniforms = FlameUniforms {
+            view_proj: view_proj.to_cols_array_2d(),
+            camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 0.0],
+        };
+
+        if let Some(ref uniform_buffer) = self.flame_uniform_buffer {
+            self.queue.write_buffer(uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        }
+
+        let mut instance_data: Vec<FlameInstance> = Vec::with_capacity(flames.len());
+        for (position, size, _texture_index) in flames {
+            instance_data.push(FlameInstance {
+                position_size: [position.x, position.y, position.z, *size],
             });
+        }
+
+        if !instance_data.is_empty() {
+            self.queue.write_buffer(
+                self.flame_instance_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(&instance_data),
+            );
         }
 
         let pipeline = self.flame_pipeline.as_ref().unwrap();
@@ -2380,12 +2857,10 @@ impl MD3Renderer {
         });
 
         render_pass.set_pipeline(pipeline);
-
-        for data in &render_data {
-            render_pass.set_bind_group(0, &data.bind_group, &[]);
-            render_pass.set_vertex_buffer(0, data.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(data.index_buffer.slice(..), IndexFormat::Uint16);
-            render_pass.draw_indexed(0..6, 0, 0..1);
-        }
+        render_pass.set_bind_group(0, self.flame_bind_group.as_ref().unwrap(), &[]);
+        render_pass.set_vertex_buffer(0, self.particle_quad_vertex_buffer.as_ref().unwrap().slice(..));
+        render_pass.set_vertex_buffer(1, self.flame_instance_buffer.as_ref().unwrap().slice(..));
+        render_pass.set_index_buffer(self.particle_quad_index_buffer.as_ref().unwrap().slice(..), IndexFormat::Uint16);
+        render_pass.draw_indexed(0..6, 0, 0..flames.len() as u32);
     }
 }

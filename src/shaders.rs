@@ -301,7 +301,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let edge_dist = length(input.vertex_to_center);
     let edge_softness = smoothstep(0.3, 0.0, edge_dist);
     
-    let shadow_alpha = 0.65 * distance_falloff * (0.6 + 0.4 * edge_softness);
+    let shadow_alpha = 0.85 * distance_falloff * (0.6 + 0.4 * edge_softness);
     
     return vec4<f32>(0.0, 0.0, 0.0, shadow_alpha);
 }
@@ -380,10 +380,27 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     
     let shadow_pos_center = light_pos + light_to_vertex * t;
     
+    let ground_y = -1.50;
+    if (shadow_pos_center.y < ground_y) {
+        output.clip_position = vec4<f32>(0.0, 0.0, -10.0, 1.0);
+        output.world_pos = vec2<f32>(0.0, 0.0);
+        output.light_pos_2d = vec2<f32>(0.0, 0.0);
+        output.vertex_to_center = vec2<f32>(0.0, 0.0);
+        return output;
+    }
+    
     let shadow_center_2d = vec2<f32>(light_pos.x, light_pos.y);
     let to_shadow = vec2<f32>(shadow_pos_center.x, shadow_pos_center.y) - shadow_center_2d;
     let expand_amount = 0.15;
     let shadow_pos_expanded = shadow_pos_center.xy + normalize(to_shadow) * expand_amount;
+    
+    if (shadow_pos_expanded.y < ground_y) {
+        output.clip_position = vec4<f32>(0.0, 0.0, -10.0, 1.0);
+        output.world_pos = vec2<f32>(0.0, 0.0);
+        output.light_pos_2d = vec2<f32>(0.0, 0.0);
+        output.vertex_to_center = vec2<f32>(0.0, 0.0);
+        return output;
+    }
     
     output.clip_position = uniforms.view_proj * vec4<f32>(shadow_pos_expanded.x, shadow_pos_expanded.y, wall_z + 0.01, 1.0);
     output.world_pos = shadow_pos_expanded;
@@ -395,7 +412,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let dist_to_light = length(input.world_pos - input.light_pos_2d);
-    let max_shadow_dist = 15.0;
+    let max_shadow_dist = 85.0;
     let soft_edge_width = 2.0;
     
     let distance_falloff = smoothstep(max_shadow_dist, max_shadow_dist - soft_edge_width, dist_to_light);
@@ -403,7 +420,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let edge_dist = length(input.vertex_to_center);
     let edge_softness = smoothstep(0.3, 0.0, edge_dist);
     
-    let shadow_alpha = 0.7 * distance_falloff * (0.6 + 0.4 * edge_softness);
+    let shadow_alpha = 1.3 * distance_falloff * (0.6 + 0.4 * edge_softness);
     
     return vec4<f32>(0.0, 0.0, 0.0, shadow_alpha);
 }
@@ -561,46 +578,59 @@ struct VertexInput {
     @location(3) normal: vec3<f32>,
 }
 
+struct InstanceInput {
+    @location(4) position_size: vec4<f32>,
+    @location(5) alpha: f32,
+}
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) color: vec4<f32>,
+    @location(1) alpha: f32,
 }
 
 struct Uniforms {
     view_proj: mat4x4<f32>,
-    model: mat4x4<f32>,
     camera_pos: vec4<f32>,
 }
 
 @group(0) @binding(0)
 var<uniform> uniforms: Uniforms;
 
+@group(0) @binding(1)
+var smoke_texture: texture_2d<f32>;
+
+@group(0) @binding(2)
+var smoke_sampler: sampler;
+
 @vertex
-fn vs_main(input: VertexInput) -> VertexOutput {
+fn vs_main(input: VertexInput, instance: InstanceInput) -> VertexOutput {
     var output: VertexOutput;
-    let world_pos = uniforms.model * vec4<f32>(input.position, 1.0);
+    let instance_pos = instance.position_size.xyz;
+    let instance_size = instance.position_size.w;
+    
+    let world_pos = vec4<f32>(instance_pos, 1.0);
     
     let to_camera = normalize(uniforms.camera_pos.xyz - world_pos.xyz);
     let right = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), to_camera));
     let up = cross(to_camera, right);
     
-    let billboard_pos = world_pos.xyz + right * (input.uv.x - 0.5) * 2.0 + up * (input.uv.y - 0.5) * 2.0;
+    let billboard_pos = world_pos.xyz + right * (input.uv.x - 0.5) * 2.0 * instance_size + up * (input.uv.y - 0.5) * 2.0 * instance_size;
     
     output.clip_position = uniforms.view_proj * vec4<f32>(billboard_pos, 1.0);
     output.uv = input.uv;
-    output.color = input.color;
+    output.alpha = instance.alpha;
     return output;
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let center = vec2<f32>(0.5, 0.5);
-    let dist = length(input.uv - center);
-    let alpha = smoothstep(0.5, 0.2, dist) * input.color.a;
-    
-    let smoke_color = vec3<f32>(0.3, 0.3, 0.35);
-    return vec4<f32>(smoke_color, alpha * 0.4);
+    let tex_color = textureSample(smoke_texture, smoke_sampler, input.uv);
+    let dist = distance(input.uv, vec2<f32>(0.5, 0.5));
+    let edge = smoothstep(0.5, 0.2, dist);
+    let alpha = tex_color.a * input.alpha * edge;
+    let color = tex_color.rgb;
+    return vec4<f32>(color, alpha);
 }
 "#;
 
@@ -612,54 +642,54 @@ struct VertexInput {
     @location(3) normal: vec3<f32>,
 }
 
+struct InstanceInput {
+    @location(4) position_size: vec4<f32>,
+}
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) color: vec4<f32>,
 }
 
 struct Uniforms {
     view_proj: mat4x4<f32>,
-    model: mat4x4<f32>,
     camera_pos: vec4<f32>,
-    time: f32,
-    _padding0: f32,
-    _padding1: f32,
-    _padding2: f32,
 }
 
 @group(0) @binding(0)
 var<uniform> uniforms: Uniforms;
 
+@group(0) @binding(1)
+var flame_texture: texture_2d<f32>;
+
+@group(0) @binding(2)
+var flame_sampler: sampler;
+
 @vertex
-fn vs_main(input: VertexInput) -> VertexOutput {
+fn vs_main(input: VertexInput, instance: InstanceInput) -> VertexOutput {
     var output: VertexOutput;
-    let world_pos = uniforms.model * vec4<f32>(input.position, 1.0);
+    let instance_pos = instance.position_size.xyz;
+    let instance_size = instance.position_size.w;
+    
+    let world_pos = vec4<f32>(instance_pos, 1.0);
     
     let to_camera = normalize(uniforms.camera_pos.xyz - world_pos.xyz);
     let right = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), to_camera));
     let up = cross(to_camera, right);
     
-    let billboard_pos = world_pos.xyz + right * (input.uv.x - 0.5) * 1.5 + up * (input.uv.y - 0.5) * 1.5;
+    let uv_x = input.uv.x - 0.5;
+    let uv_y = input.uv.y - 0.5;
+    
+    let billboard_pos = world_pos.xyz + right * uv_x * instance_size + up * uv_y * instance_size;
     
     output.clip_position = uniforms.view_proj * vec4<f32>(billboard_pos, 1.0);
     output.uv = input.uv;
-    output.color = input.color;
     return output;
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let center = vec2<f32>(0.5, 0.5);
-    let dist = length(input.uv - center);
-    
-    let flicker = sin(uniforms.time * 30.0) * 0.1 + 0.9;
-    let alpha = smoothstep(0.5, 0.0, dist) * input.color.a * flicker;
-    
-    let inner_color = vec3<f32>(1.0, 0.9, 0.6);
-    let outer_color = vec3<f32>(1.0, 0.4, 0.1);
-    let flame_color = mix(outer_color, inner_color, 1.0 - dist * 2.0);
-    
-    return vec4<f32>(flame_color, alpha);
+    let tex_color = textureSample(flame_texture, flame_sampler, input.uv);
+    return vec4<f32>(tex_color.rgb, tex_color.a);
 }
 "#;

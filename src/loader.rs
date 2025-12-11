@@ -264,3 +264,98 @@ pub fn load_weapon_textures_static(
     texture_paths
 }
 
+pub fn load_rocket_textures_static(
+    wgpu_renderer: &mut WgpuRenderer,
+    md3_renderer: &mut MD3Renderer,
+    model: &MD3Model,
+) -> Vec<Option<String>> {
+    let mut texture_paths = Vec::new();
+    
+    for mesh in &model.meshes {
+        let raw_name = std::str::from_utf8(&mesh.header.name)
+            .unwrap_or("")
+            .trim_end_matches('\0');
+        let shader_name = if raw_name.is_empty() || raw_name == "default" {
+            "rocket"
+        } else {
+            raw_name
+        };
+        
+        let candidates = vec![
+            format!("q3-resources/models/ammo/rocket/{}.png", shader_name),
+            format!("q3-resources/models/ammo/rocket/{}.jpg", shader_name),
+            format!("q3-resources/models/ammo/rocket/{}.tga", shader_name),
+            format!("../q3-resources/models/ammo/rocket/{}.png", shader_name),
+            format!("../q3-resources/models/ammo/rocket/{}.jpg", shader_name),
+            format!("../q3-resources/models/ammo/rocket/{}.tga", shader_name),
+        ];
+        
+        let texture_path = candidates
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .map(|s| s.to_string());
+
+        if let Some(ref path) = texture_path {
+            if let Ok(data) = std::fs::read(path) {
+                if let Ok(img) = image::load_from_memory(&data) {
+                    let img = img.to_rgba8();
+                    let size = Extent3d {
+                        width: img.width(),
+                        height: img.height(),
+                        depth_or_array_layers: 1,
+                    };
+                    let texture = wgpu_renderer.device.create_texture(&TextureDescriptor {
+                        label: Some("Rocket Texture"),
+                        size,
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: TextureDimension::D2,
+                        format: TextureFormat::Rgba8UnormSrgb,
+                        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+
+                    wgpu_renderer.queue.write_texture(
+                        ImageCopyTexture {
+                            texture: &texture,
+                            mip_level: 0,
+                            origin: Origin3d::ZERO,
+                            aspect: TextureAspect::All,
+                        },
+                        &img,
+                        ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(4 * img.width()),
+                            rows_per_image: Some(img.height()),
+                        },
+                        size,
+                    );
+
+                    let view = texture.create_view(&TextureViewDescriptor::default());
+                    let sampler = wgpu_renderer.device.create_sampler(&SamplerDescriptor {
+                        address_mode_u: AddressMode::Repeat,
+                        address_mode_v: AddressMode::Repeat,
+                        address_mode_w: AddressMode::Repeat,
+                        mag_filter: FilterMode::Linear,
+                        min_filter: FilterMode::Linear,
+                        mipmap_filter: FilterMode::Linear,
+                        ..Default::default()
+                    });
+
+                    let wgpu_tex = WgpuTexture {
+                        texture,
+                        view,
+                        sampler,
+                    };
+
+                    md3_renderer.load_texture(path, wgpu_tex);
+                }
+            }
+        }
+
+        texture_paths.push(texture_path);
+    }
+    
+    texture_paths
+}
+
