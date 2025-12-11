@@ -2,7 +2,7 @@
 
 <img src="assets/mvp-4.png" alt="MVP 4"/>
 
-Продолжение проекта [a-kuz/sas](https://github.com/a-kuz/sas)ы. Разработка начата.
+Продолжение проекта [a-kuz/sas](https://github.com/a-kuz/sas). Разработка начата.
 
 
 ## Screenshots
