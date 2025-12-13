@@ -2,257 +2,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use wgpu::*;
 use wgpu::util::DeviceExt;
-use winit::window::Window;
 use glam::{Mat4, Vec3};
 use bytemuck::{Pod, Zeroable};
 use crate::engine::md3::MD3Model;
+use crate::engine::renderer::types::*;
+use crate::engine::renderer::shadows::*;
 use crate::engine::shaders::{MD3_SHADER, GROUND_SHADER, SHADOW_SHADER, WALL_SHADOW_SHADER, PARTICLE_SHADER, FLAME_SHADER, WALL_SHADER, DEBUG_LIGHT_SPHERE_SHADER, DEBUG_LIGHT_RAY_SHADER, SHADOW_VOLUME_SHADER, SHADOW_APPLY_SHADER, SHADOW_PLANAR_SHADER};
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-pub struct VertexData {
-    pub position: [f32; 3],
-    pub uv: [f32; 2],
-    pub color: [f32; 4],
-    pub normal: [f32; 3],
-}
-
-impl VertexData {
-    pub fn desc() -> VertexBufferLayout<'static> {
-        VertexBufferLayout {
-            array_stride: std::mem::size_of::<VertexData>() as BufferAddress,
-            step_mode: VertexStepMode::Vertex,
-            attributes: &[
-                VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: VertexFormat::Float32x3,
-                },
-                VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 3]>() as BufferAddress,
-                    shader_location: 1,
-                    format: VertexFormat::Float32x2,
-                },
-                VertexAttribute {
-                    offset: (std::mem::size_of::<[f32; 3]>() + std::mem::size_of::<[f32; 2]>()) as BufferAddress,
-                    shader_location: 2,
-                    format: VertexFormat::Float32x4,
-                },
-                VertexAttribute {
-                    offset: (std::mem::size_of::<[f32; 3]>() + std::mem::size_of::<[f32; 2]>() + std::mem::size_of::<[f32; 4]>()) as BufferAddress,
-                    shader_location: 3,
-                    format: VertexFormat::Float32x3,
-                },
-            ],
-        }
-    }
-}
-
-const MAX_LIGHTS: usize = 8;
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub struct LightData {
-    pub position: [f32; 4],
-    pub color: [f32; 4],
-    pub radius: f32,
-    pub _padding: [f32; 3],
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub struct MD3Uniforms {
-    pub view_proj: [[f32; 4]; 4],
-    pub model: [[f32; 4]; 4],
-    pub camera_pos: [f32; 4],
-    pub lights: [LightData; MAX_LIGHTS],
-    pub num_lights: i32,
-    pub ambient_light: f32,
-    pub _padding: [f32; 2],
-}
-
-pub struct WgpuTexture {
-    pub texture: Texture,
-    pub view: TextureView,
-    pub sampler: Sampler,
-}
-
-pub struct WgpuRenderer {
-    pub device: Arc<Device>,
-    pub queue: Arc<Queue>,
-    pub surface: Surface<'static>,
-    pub surface_config: SurfaceConfiguration,
-    pub size: winit::dpi::PhysicalSize<u32>,
-    logical_size: winit::dpi::PhysicalSize<u32>,
-    pixel_ratio: f64,
-}
-
-impl WgpuRenderer {
-    pub async fn new(window: Arc<Window>) -> Result<Self, String> {
-        let pixel_ratio = 2.0;
-        let logical_size = window.inner_size();
-        let size = winit::dpi::PhysicalSize::new(
-            (logical_size.width as f64 * pixel_ratio) as u32,
-            (logical_size.height as f64 * pixel_ratio) as u32,
-        );
-        
-        let instance = Instance::new(InstanceDescriptor {
-            backends: Backends::all(),
-            ..Default::default()
-        });
-
-        let surface = instance.create_surface(window.clone())
-            .map_err(|e| format!("Failed to create surface: {:?}", e))?;
-
-        let adapter = instance
-            .request_adapter(&RequestAdapterOptions {
-                power_preference: PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .expect("Failed to find an appropriate adapter");
-
-        let (device, queue) = adapter
-            .request_device(
-                &DeviceDescriptor {
-                    required_features: Features::empty(),
-                    required_limits: Limits::default(),
-                    label: None,
-                },
-                None,
-            )
-            .await
-            .expect("Failed to create device");
-
-        let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(surface_caps.formats[0]);
-
-        let surface_config = SurfaceConfiguration {
-            usage: TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.width,
-            height: size.height,
-            present_mode: PresentMode::AutoVsync,
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-
-        surface.configure(&device, &surface_config);
-
-        Ok(Self {
-            device: Arc::new(device),
-            queue: Arc::new(queue),
-            surface,
-            surface_config,
-            size,
-            logical_size,
-            pixel_ratio,
-        })
-    }
-
-    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            self.logical_size = new_size;
-            let size = winit::dpi::PhysicalSize::new(
-                (new_size.width as f64 * self.pixel_ratio) as u32,
-                (new_size.height as f64 * self.pixel_ratio) as u32,
-            );
-            self.size = size;
-            self.surface_config.width = size.width;
-            self.surface_config.height = size.height;
-            self.surface.configure(&self.device, &self.surface_config);
-        }
-    }
-
-    pub fn begin_frame(&mut self) -> Option<SurfaceTexture> {
-        self.surface.get_current_texture().ok()
-    }
-
-    pub fn end_frame(&mut self, frame: SurfaceTexture) {
-        frame.present();
-    }
-
-    pub fn get_viewport_size(&self) -> (u32, u32) {
-        (self.logical_size.width, self.logical_size.height)
-    }
-
-    pub fn get_surface_size(&self) -> (u32, u32) {
-        (self.size.width, self.size.height)
-    }
-}
-
-struct MeshRenderData {
-    vertex_buffer: Arc<Buffer>,
-    index_buffer: Arc<Buffer>,
-    num_indices: u32,
-    bind_group: BindGroup,
-    shadow_bind_group: Option<BindGroup>,
-    uniform_buffer: Arc<Buffer>,
-    shadow_uniform_buffer: Option<Arc<Buffer>>,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-pub struct ShadowVolumeVertex {
-    pub position: [f32; 3],
-    pub extrude_dir: [f32; 3],
-}
-
-impl ShadowVolumeVertex {
-    pub fn desc() -> VertexBufferLayout<'static> {
-        VertexBufferLayout {
-            array_stride: std::mem::size_of::<ShadowVolumeVertex>() as BufferAddress,
-            step_mode: VertexStepMode::Vertex,
-            attributes: &[
-                VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: VertexFormat::Float32x3,
-                },
-                VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 3]>() as BufferAddress,
-                    shader_location: 1,
-                    format: VertexFormat::Float32x3,
-                },
-            ],
-        }
-    }
-}
-
-struct Edge {
-    v0: usize,
-    v1: usize,
-}
-
-struct SilhouetteEdge {
-    v0: Vec3,
-    v1: Vec3,
-}
-
-struct ModelSilhouetteCache {
-    edges: Vec<Edge>,
-    triangle_neighbors: Vec<[Option<usize>; 3]>,
-}
-
-#[derive(Hash, PartialEq, Eq, Clone)]
-struct BufferCacheKey {
-    model_id: usize,
-    mesh_idx: usize,
-    frame_idx: usize,
-}
-
-struct CachedBuffers {
-    vertex_buffer: Arc<Buffer>,
-    index_buffer: Arc<Buffer>,
-    num_indices: u32,
-}
+use super::buffers::{BufferCacheKey, CachedBuffers};
+use super::layouts::*;
+use super::pipelines::*;
 
 pub struct MD3Renderer {
     pub device: Arc<Device>,
@@ -317,13 +76,13 @@ pub struct MD3Renderer {
 
 impl MD3Renderer {
     pub fn new(device: Arc<Device>, queue: Arc<Queue>) -> Self {
-        let bind_group_layout = Self::create_md3_bind_group_layout(&device);
-        let ground_bind_group_layout = Self::create_ground_bind_group_layout(&device);
-        let wall_bind_group_layout = Self::create_wall_bind_group_layout(&device);
-        let particle_bind_group_layout = Self::create_particle_bind_group_layout(&device);
-        let debug_light_sphere_bind_group_layout = Self::create_debug_light_sphere_bind_group_layout(&device);
-        let debug_light_ray_bind_group_layout = Self::create_debug_light_ray_bind_group_layout(&device);
-        let shadow_volume_bind_group_layout = Self::create_shadow_volume_bind_group_layout(&device);
+        let bind_group_layout = create_md3_bind_group_layout(&device);
+        let ground_bind_group_layout = create_ground_bind_group_layout(&device);
+        let wall_bind_group_layout = create_wall_bind_group_layout(&device);
+        let particle_bind_group_layout = create_particle_bind_group_layout(&device);
+        let debug_light_sphere_bind_group_layout = create_debug_light_sphere_bind_group_layout(&device);
+        let debug_light_ray_bind_group_layout = create_debug_light_ray_bind_group_layout(&device);
+        let shadow_volume_bind_group_layout = create_shadow_volume_bind_group_layout(&device);
 
         let uniform_buffer_pool = Some(device.create_buffer(&BufferDescriptor {
             label: Some("Uniform Buffer Pool"),
@@ -394,286 +153,88 @@ impl MD3Renderer {
         }
     }
 
-    fn create_md3_bind_group_layout(device: &Device) -> BindGroupLayout {
-        device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: Some("MD3 Bind Group Layout"),
-            entries: &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<MD3Uniforms>() as u64),
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        })
+    pub fn clear_model_cache(&mut self) {
+        self.buffer_cache.clear();
+        self.silhouette_cache.clear();
     }
 
-    fn create_ground_bind_group_layout(device: &Device) -> BindGroupLayout {
-        device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: Some("Ground Bind Group Layout"),
-            entries: &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<MD3Uniforms>() as u64),
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        })
+    fn get_or_create_buffers(&mut self, model: &MD3Model, mesh_idx: usize, frame_idx: usize) -> Option<(Arc<Buffer>, Arc<Buffer>, u32)> {
+        super::buffers::get_or_create_buffers(&mut self.buffer_cache, &self.device, model, mesh_idx, frame_idx)
     }
 
-    fn create_wall_bind_group_layout(device: &Device) -> BindGroupLayout {
-        device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: Some("Wall Bind Group Layout"),
-            entries: &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<MD3Uniforms>() as u64),
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        })
+    fn create_uniforms(
+        &self,
+        view_proj: Mat4,
+        model: Mat4,
+        camera_pos: Vec3,
+        lights: &[(Vec3, Vec3, f32)],
+        ambient_light: f32,
+    ) -> MD3Uniforms {
+        super::buffers::create_uniforms(view_proj, model, camera_pos, lights, ambient_light)
     }
 
-    fn create_particle_bind_group_layout(device: &Device) -> BindGroupLayout {
-        #[repr(C)]
-        struct ParticleUniforms {
-            view_proj: [[f32; 4]; 4],
-            camera_pos: [f32; 4],
-        }
-        #[repr(C)]
-        struct FlameUniforms {
-            view_proj: [[f32; 4]; 4],
-            camera_pos: [f32; 4],
-            time: f32,
-            _padding0: f32,
-            _padding1: f32,
-            _padding2: f32,
-        }
-        let particle_size = std::mem::size_of::<ParticleUniforms>() as u64;
-        let flame_size = std::mem::size_of::<FlameUniforms>() as u64;
-        let max_size = particle_size.max(flame_size);
-        device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: Some("Particle Bind Group Layout"),
-            entries: &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(max_size),
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        })
+    fn update_uniform_buffer(&self, uniforms: &MD3Uniforms, buffer: &Buffer) {
+        super::buffers::update_uniform_buffer(&self.queue, uniforms, buffer);
     }
 
-    fn create_debug_light_sphere_bind_group_layout(device: &Device) -> BindGroupLayout {
-        #[repr(C)]
-        struct DebugLightSphereUniforms {
-            view_proj: [[f32; 4]; 4],
-            camera_pos: [f32; 4],
-        }
-        device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: Some("Debug Light Sphere Bind Group Layout"),
-            entries: &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<DebugLightSphereUniforms>() as u64),
-                    },
-                    count: None,
-                },
-            ],
-        })
+    fn find_texture(&self, path: &str) -> Option<&WgpuTexture> {
+        super::buffers::find_texture(&self.model_textures, path)
     }
 
-    fn create_debug_light_ray_bind_group_layout(device: &Device) -> BindGroupLayout {
-        #[repr(C)]
-        struct DebugLightRayUniforms {
-            view_proj: [[f32; 4]; 4],
-        }
-        device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: Some("Debug Light Ray Bind Group Layout"),
-            entries: &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::VERTEX,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<DebugLightRayUniforms>() as u64),
-                    },
-                    count: None,
-                },
-            ],
-        })
+    fn create_mesh_bind_groups(
+        &self,
+        texture: &WgpuTexture,
+        uniform_buffer: &Buffer,
+        shadow_uniform_buffer: Option<&Buffer>,
+        render_shadow: bool,
+    ) -> (BindGroup, Option<BindGroup>) {
+        super::buffers::create_mesh_bind_groups(
+            &self.device,
+            &self.bind_group_layout,
+            texture,
+            uniform_buffer,
+            shadow_uniform_buffer,
+            render_shadow,
+        )
     }
 
-    fn create_shadow_volume_bind_group_layout(device: &Device) -> BindGroupLayout {
-        #[repr(C)]
-        struct ShadowVolumeUniforms {
-            view_proj: [[f32; 4]; 4],
-            light_pos: [f32; 4],
-            extrude_distance: f32,
-            _padding: [f32; 3],
-        }
-        device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: Some("Shadow Volume Bind Group Layout"),
-            entries: &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::VERTEX,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<ShadowVolumeUniforms>() as u64),
-                    },
-                    count: None,
-                },
-            ],
-        })
+    fn prepare_mesh_data(
+        &mut self,
+        model: &MD3Model,
+        frame_idx: usize,
+        texture_paths: &[Option<String>],
+        uniform_buffer: Arc<Buffer>,
+        shadow_uniform_buffer: Option<Arc<Buffer>>,
+        render_shadow: bool,
+    ) -> Vec<MeshRenderData> {
+        super::buffers::prepare_mesh_data(
+            &mut self.buffer_cache,
+            &self.device,
+            &self.bind_group_layout,
+            &self.model_textures,
+            model,
+            frame_idx,
+            texture_paths,
+            uniform_buffer,
+            shadow_uniform_buffer,
+            render_shadow,
+        )
     }
+
+
+
+
+
+
+
 
     pub fn load_texture(&mut self, path: &str, texture: WgpuTexture) {
         self.model_textures.insert(path.to_string(), texture);
     }
 
-    fn create_depth_stencil_state(depth_write_enabled: bool) -> DepthStencilState {
-        DepthStencilState {
-            format: TextureFormat::Depth24PlusStencil8,
-            depth_write_enabled,
-            depth_compare: CompareFunction::Less,
-            stencil: StencilState::default(),
-            bias: DepthBiasState::default(),
-        }
-    }
 
-    fn create_primitive_state(cull_mode: Option<Face>) -> PrimitiveState {
-        PrimitiveState {
-            topology: PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: FrontFace::Cw,
-            cull_mode,
-            polygon_mode: PolygonMode::Fill,
-            unclipped_depth: false,
-            conservative: false,
-        }
-    }
 
-    fn create_multisample_state() -> MultisampleState {
-        MultisampleState {
-            count: 1,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        }
-    }
 
-    fn create_color_target_state(surface_format: TextureFormat) -> ColorTargetState {
-        ColorTargetState {
-            format: surface_format,
-            blend: Some(BlendState::ALPHA_BLENDING),
-            write_mask: ColorWrites::ALL,
-        }
-    }
 
     pub fn create_pipeline(&mut self, surface_format: TextureFormat) {
         let shader = self.device.create_shader_module(ShaderModuleDescriptor {
@@ -699,12 +260,12 @@ impl MD3Renderer {
             fragment: Some(FragmentState {
                 module: &shader,
                 entry_point: "fs_main",
-                targets: &[Some(Self::create_color_target_state(surface_format))],
+                targets: &[Some(create_color_target_state(surface_format))],
                 compilation_options: PipelineCompilationOptions::default(),
             }),
-            primitive: Self::create_primitive_state(Some(Face::Back)),
-            depth_stencil: Some(Self::create_depth_stencil_state(true)),
-            multisample: Self::create_multisample_state(),
+            primitive: create_primitive_state(Some(Face::Back)),
+            depth_stencil: Some(create_depth_stencil_state(true)),
+            multisample: create_multisample_state(),
             multiview: None,
         });
 
@@ -733,12 +294,12 @@ impl MD3Renderer {
             fragment: Some(FragmentState {
                 module: &ground_shader,
                 entry_point: "fs_main",
-                targets: &[Some(Self::create_color_target_state(surface_format))],
+                targets: &[Some(create_color_target_state(surface_format))],
                 compilation_options: PipelineCompilationOptions::default(),
             }),
-            primitive: Self::create_primitive_state(None),
-            depth_stencil: Some(Self::create_depth_stencil_state(true)),
-            multisample: Self::create_multisample_state(),
+            primitive: create_primitive_state(None),
+            depth_stencil: Some(create_depth_stencil_state(true)),
+            multisample: create_multisample_state(),
             multiview: None,
         });
 
@@ -767,12 +328,12 @@ impl MD3Renderer {
             fragment: Some(FragmentState {
                 module: &wall_shader,
                 entry_point: "fs_main",
-                targets: &[Some(Self::create_color_target_state(surface_format))],
+                targets: &[Some(create_color_target_state(surface_format))],
                 compilation_options: PipelineCompilationOptions::default(),
             }),
-            primitive: Self::create_primitive_state(None),
-            depth_stencil: Some(Self::create_depth_stencil_state(true)),
-            multisample: Self::create_multisample_state(),
+            primitive: create_primitive_state(None),
+            depth_stencil: Some(create_depth_stencil_state(true)),
+            multisample: create_multisample_state(),
             multiview: None,
         });
 
@@ -846,9 +407,9 @@ impl MD3Renderer {
                 targets: &[Some(shadow_color_target.clone())],
                 compilation_options: PipelineCompilationOptions::default(),
             }),
-            primitive: Self::create_primitive_state(None),
+            primitive: create_primitive_state(None),
             depth_stencil: Some(shadow_depth_stencil),
-            multisample: Self::create_multisample_state(),
+            multisample: create_multisample_state(),
             multiview: None,
         });
 
@@ -903,9 +464,9 @@ impl MD3Renderer {
                 targets: &[Some(shadow_color_target.clone())],
                 compilation_options: PipelineCompilationOptions::default(),
             }),
-            primitive: Self::create_primitive_state(None),
+            primitive: create_primitive_state(None),
             depth_stencil: Some(wall_shadow_depth_stencil),
-            multisample: Self::create_multisample_state(),
+            multisample: create_multisample_state(),
             multiview: None,
         });
 
@@ -1065,7 +626,7 @@ impl MD3Renderer {
                 })],
                 compilation_options: PipelineCompilationOptions::default(),
             }),
-            primitive: Self::create_primitive_state(None),
+            primitive: create_primitive_state(None),
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth24PlusStencil8,
                 depth_write_enabled: false,
@@ -1073,7 +634,7 @@ impl MD3Renderer {
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
-            multisample: Self::create_multisample_state(),
+            multisample: create_multisample_state(),
             multiview: None,
         });
 
@@ -1132,7 +693,7 @@ impl MD3Renderer {
                 })],
                 compilation_options: PipelineCompilationOptions::default(),
             }),
-            primitive: Self::create_primitive_state(None),
+            primitive: create_primitive_state(None),
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth24PlusStencil8,
                 depth_write_enabled: false,
@@ -1140,7 +701,7 @@ impl MD3Renderer {
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
-            multisample: Self::create_multisample_state(),
+            multisample: create_multisample_state(),
             multiview: None,
         });
 
@@ -1376,7 +937,7 @@ impl MD3Renderer {
                 conservative: false,
             },
             depth_stencil: Some(shadow_volume_depth_stencil_front.clone()),
-            multisample: Self::create_multisample_state(),
+            multisample: create_multisample_state(),
             multiview: None,
         });
 
@@ -1411,7 +972,7 @@ impl MD3Renderer {
                 conservative: false,
             },
             depth_stencil: Some(shadow_volume_depth_stencil_back),
-            multisample: Self::create_multisample_state(),
+            multisample: create_multisample_state(),
             multiview: None,
         });
 
@@ -1504,7 +1065,7 @@ impl MD3Renderer {
                 conservative: false,
             },
             depth_stencil: Some(shadow_apply_depth_stencil),
-            multisample: Self::create_multisample_state(),
+            multisample: create_multisample_state(),
             multiview: None,
         });
 
@@ -1599,7 +1160,7 @@ impl MD3Renderer {
                 conservative: false,
             },
             depth_stencil: Some(shadow_planar_depth_stencil),
-            multisample: Self::create_multisample_state(),
+            multisample: create_multisample_state(),
             multiview: None,
         });
 
@@ -1682,270 +1243,13 @@ impl MD3Renderer {
         }
     }
 
-    fn get_or_create_buffers(&mut self, model: &MD3Model, mesh_idx: usize, frame_idx: usize) -> Option<(Arc<Buffer>, Arc<Buffer>, u32)> {
-        let model_id = std::ptr::addr_of!(*model) as usize;
-        let key = BufferCacheKey {
-            model_id,
-            mesh_idx,
-            frame_idx,
-        };
-        
-        if let Some(cached) = self.buffer_cache.get(&key) {
-            return Some((cached.vertex_buffer.clone(), cached.index_buffer.clone(), cached.num_indices));
-        }
-        
-        let (vertex_buffer, index_buffer, num_indices) = self.create_buffers_internal(model, mesh_idx, frame_idx)?;
-        let cached = CachedBuffers {
-            vertex_buffer: Arc::new(vertex_buffer),
-            index_buffer: Arc::new(index_buffer),
-            num_indices,
-        };
-        let result = (cached.vertex_buffer.clone(), cached.index_buffer.clone(), cached.num_indices);
-        self.buffer_cache.insert(key, cached);
-        Some(result)
-    }
-    
-    fn create_buffers_internal(&self, model: &MD3Model, mesh_idx: usize, frame_idx: usize) -> Option<(Buffer, Buffer, u32)> {
-        if mesh_idx >= model.meshes.len() {
-            return None;
-        }
-        
-        let mesh = &model.meshes[mesh_idx];
-        if frame_idx >= mesh.vertices.len() {
-            return None;
-        }
-        
-        let frame_vertices = &mesh.vertices[frame_idx];
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
-
-        for (i, vertex) in frame_vertices.iter().enumerate() {
-            let vertex_data = vertex.vertex;
-            let x = vertex_data[0] as f32 * (1.0 / 64.0);
-            let y = vertex_data[1] as f32 * (1.0 / 64.0);
-            let z = vertex_data[2] as f32 * (1.0 / 64.0);
-
-            let normal_encoded = vertex.normal;
-            let lat = ((normal_encoded >> 8) & 0xFF) as f32 * 2.0 * std::f32::consts::PI / 255.0;
-            let lng = (normal_encoded & 0xFF) as f32 * 2.0 * std::f32::consts::PI / 255.0;
-            let nx = lat.cos() * lng.sin();
-            let ny = lat.sin() * lng.sin();
-            let nz = lng.cos();
-
-            let tex_coord = if i < mesh.tex_coords.len() {
-                mesh.tex_coords[i].coord
-            } else {
-                [0.0, 0.0]
-            };
-
-            vertices.push(VertexData {
-                position: [x, y, z],
-                uv: [tex_coord[0], tex_coord[1]],
-                color: [1.0, 1.0, 1.0, 1.0], // White color - texture will provide the actual color
-                normal: [nx, ny, nz],
-            });
-        }
-
-        for triangle in &mesh.triangles {
-            indices.push(triangle.vertex[0] as u16);
-            indices.push(triangle.vertex[1] as u16);
-            indices.push(triangle.vertex[2] as u16);
-        }
-        
-        let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MD3 Vertex Buffer"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: BufferUsages::VERTEX,
-        });
-        
-        let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MD3 Index Buffer"),
-            contents: bytemuck::cast_slice(&indices),
-            usage: BufferUsages::INDEX,
-        });
-        
-        let num_indices = indices.len() as u32;
-        
-        Some((vertex_buffer, index_buffer, num_indices))
-    }
-
-    fn create_uniforms(
-        &self,
-        view_proj: Mat4,
-        model: Mat4,
-        camera_pos: Vec3,
-        lights: &[(Vec3, Vec3, f32)],
-        ambient_light: f32,
-    ) -> MD3Uniforms {
-        let mut light_data = [LightData {
-            position: [0.0; 4],
-            color: [0.0; 4],
-            radius: 0.0,
-            _padding: [0.0; 3],
-        }; MAX_LIGHTS];
-
-        for (i, (pos, color, radius)) in lights.iter().enumerate().take(MAX_LIGHTS) {
-            light_data[i] = LightData {
-                position: [pos.x, pos.y, pos.z, 0.0],
-                color: [color.x, color.y, color.z, 0.0],
-                radius: *radius,
-                _padding: [0.0; 3],
-            };
-        }
-
-        MD3Uniforms {
-            view_proj: view_proj.to_cols_array_2d(),
-            model: model.to_cols_array_2d(),
-            camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 0.0],
-            lights: light_data,
-            num_lights: lights.len().min(MAX_LIGHTS) as i32,
-            ambient_light,
-            _padding: [0.0; 2],
-        }
-    }
-
-    fn update_uniform_buffer(&self, uniforms: &MD3Uniforms, buffer: &Buffer) {
-        self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[*uniforms]));
-    }
     
 
-    fn find_texture(&self, path: &str) -> Option<&WgpuTexture> {
-        let mut alt_paths = vec![
-            path.to_string(),
-            format!("../{}", path),
-            path.replace("../", ""),
-        ];
-        
-        if path.ends_with(".tga") {
-            alt_paths.push(path.replace(".tga", ".png"));
-            alt_paths.push(path.replace(".tga", ".jpg"));
-            alt_paths.push(format!("../{}", path.replace(".tga", ".png")));
-            alt_paths.push(format!("../{}", path.replace(".tga", ".jpg")));
-        } else if path.ends_with(".png") {
-            alt_paths.push(path.replace(".png", ".tga"));
-            alt_paths.push(path.replace(".png", ".jpg"));
-            alt_paths.push(format!("../{}", path.replace(".png", ".tga")));
-            alt_paths.push(format!("../{}", path.replace(".png", ".jpg")));
-        } else if path.ends_with(".jpg") {
-            alt_paths.push(path.replace(".jpg", ".tga"));
-            alt_paths.push(path.replace(".jpg", ".png"));
-            alt_paths.push(format!("../{}", path.replace(".jpg", ".tga")));
-            alt_paths.push(format!("../{}", path.replace(".jpg", ".png")));
-        }
-        
-        for alt_path in &alt_paths {
-            if let Some(tex) = self.model_textures.get(alt_path) {
-                return Some(tex);
-            }
-        }
-        
-        println!("Warning: texture not found in HashMap for path: {:?}", path);
-        println!("Tried paths: {:?}", alt_paths);
-        println!("Available texture keys: {:?}", self.model_textures.keys().collect::<Vec<_>>());
-        None
-    }
 
-    fn create_mesh_bind_groups(
-        &self,
-        texture: &WgpuTexture,
-        uniform_buffer: &Buffer,
-        shadow_uniform_buffer: Option<&Buffer>,
-        render_shadow: bool,
-    ) -> (BindGroup, Option<BindGroup>) {
-        let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
-            label: Some("MD3 Bind Group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::TextureView(&texture.view),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: BindingResource::Sampler(&texture.sampler),
-                },
-            ],
-        });
+    
 
-        let shadow_bind_group = if render_shadow {
-            Some(self.device.create_bind_group(&BindGroupDescriptor {
-                label: Some("Shadow Bind Group"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    BindGroupEntry {
-                        binding: 0,
-                        resource: shadow_uniform_buffer.unwrap().as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: 1,
-                        resource: BindingResource::TextureView(&texture.view),
-                    },
-                    BindGroupEntry {
-                        binding: 2,
-                        resource: BindingResource::Sampler(&texture.sampler),
-                    },
-                ],
-            }))
-        } else {
-            None
-        };
 
-        (bind_group, shadow_bind_group)
-    }
 
-    fn prepare_mesh_data(
-        &mut self,
-        model: &MD3Model,
-        frame_idx: usize,
-        texture_paths: &[Option<String>],
-        uniform_buffer: Arc<Buffer>,
-        shadow_uniform_buffer: Option<Arc<Buffer>>,
-        render_shadow: bool,
-    ) -> Vec<MeshRenderData> {
-        let mut buffers_vec = Vec::new();
-        
-        for (mesh_idx, _mesh) in model.meshes.iter().enumerate() {
-            let (vertex_buffer, index_buffer, num_indices) = match self.get_or_create_buffers(model, mesh_idx, frame_idx) {
-                Some(buffers) => buffers,
-                None => continue,
-            };
-            
-            let texture_path = texture_paths.get(mesh_idx).and_then(|p| p.as_ref().map(|s| s.clone()));
-
-            if texture_path.is_some() {
-                buffers_vec.push((vertex_buffer, index_buffer, num_indices, texture_path));
-            }
-        }
-        
-        let mut mesh_data = Vec::new();
-        for (vertex_buffer, index_buffer, num_indices, texture_path) in buffers_vec {
-            let texture = texture_path.as_ref().and_then(|path| self.find_texture(path));
-            if let Some(texture) = texture {
-                let (bind_group, shadow_bind_group) = self.create_mesh_bind_groups(
-                    texture,
-                    &uniform_buffer,
-                    shadow_uniform_buffer.as_ref().map(|b| b.as_ref()),
-                    render_shadow,
-                );
-
-                mesh_data.push(MeshRenderData {
-                    vertex_buffer,
-                    index_buffer,
-                    num_indices,
-                    bind_group,
-                    shadow_bind_group,
-                    uniform_buffer: uniform_buffer.clone(),
-                    shadow_uniform_buffer: shadow_uniform_buffer.clone(),
-                });
-            }
-        }
-
-        mesh_data
-    }
 
     pub fn render_ground(
         &mut self,
@@ -3443,10 +2747,10 @@ impl MD3Renderer {
             fragment: Some(FragmentState {
                 module: &shader,
                 entry_point: "fs_main",
-                targets: &[Some(Self::create_color_target_state(surface_format))],
+                targets: &[Some(create_color_target_state(surface_format))],
                 compilation_options: PipelineCompilationOptions::default(),
             }),
-            primitive: Self::create_primitive_state(Some(Face::Back)),
+            primitive: create_primitive_state(Some(Face::Back)),
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth24PlusStencil8,
                 depth_write_enabled: true,
@@ -3454,7 +2758,7 @@ impl MD3Renderer {
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
-            multisample: Self::create_multisample_state(),
+            multisample: create_multisample_state(),
             multiview: None,
         });
 
@@ -3523,7 +2827,7 @@ impl MD3Renderer {
             fragment: Some(FragmentState {
                 module: &shader,
                 entry_point: "fs_main",
-                targets: &[Some(Self::create_color_target_state(surface_format))],
+                targets: &[Some(create_color_target_state(surface_format))],
                 compilation_options: PipelineCompilationOptions::default(),
             }),
             primitive: PrimitiveState {
@@ -3542,7 +2846,7 @@ impl MD3Renderer {
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
-            multisample: Self::create_multisample_state(),
+            multisample: create_multisample_state(),
             multiview: None,
         });
 

@@ -19,6 +19,8 @@ pub struct Player {
     pub is_crouching: bool,
     pub crouch_time: f32,
     pub jump_time: f32,
+    pub aim_angle: f32,
+    pub model_yaw: f32,
 }
 
 impl Player {
@@ -36,13 +38,62 @@ impl Player {
             is_crouching: false,
             crouch_time: 0.0,
             jump_time: 0.0,
+            aim_angle: 0.0,
+            model_yaw: 0.0,
         }
     }
 
-    pub fn update(&mut self, dt: f32, move_left: bool, move_right: bool, jump: bool, crouch: bool, ground_y: f32) {
+    pub fn update(&mut self, dt: f32, move_left: bool, move_right: bool, jump: bool, crouch: bool, ground_y: f32, aim_angle: f32) {
         let was_moving = self.is_moving;
         let was_state = self.state;
         
+        self.aim_angle = aim_angle;
+        
+        let normalized_angle = if aim_angle > std::f32::consts::PI {
+            aim_angle - 2.0 * std::f32::consts::PI
+        } else {
+            aim_angle
+        };
+
+        if normalized_angle.abs() < std::f32::consts::FRAC_PI_2 {
+            self.facing_right = true;
+        } else {
+            self.facing_right = false;
+        }
+
+        let mut target_yaw = normalized_angle;
+        
+        let current_normalized = self.model_yaw;
+        let mut angle_diff = target_yaw - current_normalized;
+        
+        while angle_diff > std::f32::consts::PI {
+            angle_diff -= 2.0 * std::f32::consts::PI;
+        }
+        while angle_diff < -std::f32::consts::PI {
+            angle_diff += 2.0 * std::f32::consts::PI;
+        }
+        
+        if angle_diff.abs() > std::f32::consts::PI * 0.9 {
+            if target_yaw > 0.0 {
+                target_yaw -= 2.0 * std::f32::consts::PI;
+            } else {
+                target_yaw += 2.0 * std::f32::consts::PI;
+            }
+            angle_diff = target_yaw - current_normalized;
+        }
+        
+        let turn_speed = 12.0;
+        let max_turn = turn_speed * dt;
+        let turn_amount = angle_diff.clamp(-max_turn, max_turn);
+        self.model_yaw += turn_amount;
+        
+        while self.model_yaw > std::f32::consts::PI {
+            self.model_yaw -= 2.0 * std::f32::consts::PI;
+        }
+        while self.model_yaw < -std::f32::consts::PI {
+            self.model_yaw += 2.0 * std::f32::consts::PI;
+        }
+
         const GRAVITY: f32 = 800.0;
         const JUMP_VELOCITY: f32 = 270.0;
         const GROUND_ACCEL: f32 = 100.0;
@@ -87,11 +138,9 @@ impl Player {
         
         if move_left && !move_right {
             self.vx -= accel * dt;
-            self.facing_right = false;
             self.is_moving = true;
         } else if move_right && !move_left {
             self.vx += accel * dt;
-            self.facing_right = true;
             self.is_moving = true;
         } else {
             self.is_moving = false;

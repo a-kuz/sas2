@@ -56,6 +56,7 @@ struct GameApp {
     window: Option<Arc<Window>>,
     wgpu_renderer: Option<WgpuRenderer>,
     md3_renderer: Option<MD3Renderer>,
+    crosshair_renderer: Option<sas2::engine::renderer::crosshair::Crosshair>,
     player_model: PlayerModel,
     player2_model: PlayerModel,
     rocket_model: Option<MD3Model>,
@@ -68,11 +69,9 @@ struct GameApp {
     frame_count: u32,
     fps: f32,
     
-    // World state
     world: World,
     local_player_id: u32,
     
-    // Input state
     move_left: bool,
     move_right: bool,
     jump_pressed: bool,
@@ -93,6 +92,17 @@ struct GameApp {
     camera_move_y_pos: bool,
     camera_move_z_neg: bool,
     camera_move_z_pos: bool,
+
+    aim_x: f32,
+    aim_y: f32,
+    last_mouse_pos: (f32, f32),
+    
+    current_legs_yaw: f32,
+    player2_legs_yaw: f32,
+    
+    available_models: Vec<&'static str>,
+    current_model_index: usize,
+    shift_pressed: bool,
 }
 
 impl GameApp {
@@ -105,6 +115,7 @@ impl GameApp {
             window: None,
             wgpu_renderer: None,
             md3_renderer: None,
+            crosshair_renderer: None,
             player_model: PlayerModel::new(),
             player2_model: PlayerModel::new(),
             rocket_model: None,
@@ -140,6 +151,21 @@ impl GameApp {
             camera_move_y_pos: false,
             camera_move_z_neg: false,
             camera_move_z_pos: false,
+            
+            aim_x: 1.0,
+            aim_y: 0.0,
+            last_mouse_pos: (0.0, 0.0),
+            
+            current_legs_yaw: 0.0,
+            player2_legs_yaw: 0.0,
+            
+            available_models: vec![
+                "sarge", "orbb", "grunt", "major", "visor", "bones", "crash", "slash",
+                "ranger", "doom", "keel", "hunter", "mynx", "razor", "uriel", "xaero",
+                "sorlag", "tankjr", "anarki", "biker", "bitterman", "klesk", "lucy"
+            ],
+            current_model_index: 0,
+            shift_pressed: false,
         }
     }
 
@@ -291,7 +317,39 @@ impl GameApp {
         }
     }
 
-    fn shoot_rocket(&mut self, view_proj: Mat4, weapon_orientation: Option<Orientation>) {
+    fn compute_weapon_world_position(
+        weapon_orientation: Option<&Orientation>,
+        player_x: f32,
+        player_y: f32,
+        model_yaw: f32,
+        ground_y: f32,
+    ) -> Vec3 {
+        if let Some(weapon_orient) = weapon_orientation {
+            let scale = 0.04;
+            let md3_correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+            let facing_rotation = Mat3::from_rotation_y(model_yaw);
+            let combined_rotation = facing_rotation * md3_correction;
+            
+            let model_bottom_offset = 0.9;
+            let render_y = ground_y + model_bottom_offset + player_y;
+            let game_translation = Mat4::from_translation(Vec3::new(player_x, render_y, 0.0));
+            let game_rotation = Mat4::from_mat3(combined_rotation);
+            let game_transform = game_translation * game_rotation;
+            let scale_mat = Mat4::from_scale(Vec3::splat(scale));
+            
+            let weapon_local_pos = weapon_orient.origin;
+            let weapon_scaled = scale_mat.transform_point3(weapon_local_pos);
+            let weapon_world = game_transform.transform_point3(weapon_scaled);
+            
+            weapon_world
+        } else {
+            let model_bottom_offset = 0.9;
+            let render_y = ground_y + model_bottom_offset + player_y;
+            Vec3::new(player_x, render_y + 0.5, 0.0)
+        }
+    }
+
+    fn shoot_rocket(&mut self, view_proj: Mat4, weapon_orientation: Option<Orientation>, aim_angle: f32) {
         let player = match self.world.players.get(self.local_player_id as usize) {
             Some(p) => p,
             None => return,
@@ -299,14 +357,52 @@ impl GameApp {
 
         let rocket_position = if let Some(weapon_orient) = weapon_orientation {
             let scale = 0.04;
+            // Use aim_angle for rotation instead of just facing_right
+            // But weapon orientation already includes some rotation from torso/weapon_bone?
+            // render_player calculates orientation based on aim_angle.
+            // So weapon_orient should be correct in world space?
+            // BUT render_player applies transformations to MD3 model matrix.
+            // weapon_orient returned by render_player IS in local space relative to upper body?
+            // No, render_player returns local orientation attached to upper?
+            // "weapon_orientation_result = Some(attach_rotated_entity(&upper_orientation, weapon_tag));"
+            // upper_orientation is attached to lower_orientation.
+            // lower_orientation is attached to world (but computed in render_player).
+            
+            // Wait, render_player logic:
+            // lower_orientation passed in.
+            // upper_orientation attached to lower.
+            // weapon_orientation attached to upper.
+            // So weapon_orientation is relative to lower_orientation's base.
+            
+            // In shoot_rocket implementation:
+            // "let facing_angle = if player.facing_right { 0.0 } else { std::f32::consts::PI };"
+            // "let game_rotation_y = Mat3::from_rotation_y(facing_angle);"
+            // "let game_transform = game_translation * game_rotation;"
+            
+            // If we change render_player to handle rotation manually, we need to replicate that here or receive the full world matrix?
+            // For now let's stick to what was there but use aim_angle for initial direction if needed?
+            // Actually, calculating proper muzzle position is hard without the full transform chain.
+            // Let's assume render_player still works similarly but we might need to adjust "game_rotation_y" if we change how player is rotated.
+            
+            // If render_player does "complex rotations", it modifies how the model sits in world.
+            // We should use the same logic here or refactor.
+            // For MVP, since we only change how model is RENDERED (visuals), the actual logic for "direction" is simple.
+            
             let facing_angle = if player.facing_right { 0.0 } else { std::f32::consts::PI };
-            let game_rotation_y = Mat3::from_rotation_y(facing_angle);
+            let md3_correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+            let facing_rotation = Mat3::from_rotation_y(facing_angle);
+            let combined_rotation = facing_rotation * md3_correction;
             
             let ground_y = self.world.map.ground_y;
             let model_bottom_offset = 0.9;
-            let render_y = ground_y + model_bottom_offset + player.y;
+            let render_y = ground_y + model_bottom_offset + player.y; // approximate
             let game_translation = Mat4::from_translation(Vec3::new(player.x, render_y, 0.0));
-            let game_rotation = Mat4::from_mat3(game_rotation_y);
+            
+            // Note: If we implement complex rotations (leaning), the barrel position will change.
+            // Ideally we need the final world matrix of the weapon tag.
+            // For now, let's keep it approximate or we might break shooting origin.
+            
+            let game_rotation = Mat4::from_mat3(combined_rotation);
             let game_transform = game_translation * game_rotation;
             let scale_mat = Mat4::from_scale(Vec3::splat(scale));
             
@@ -327,11 +423,14 @@ impl GameApp {
             Vec3::new(player.x, render_y + 0.5, 0.0)
         };
 
-        let direction = if player.facing_right {
-            Vec3::new(1.0, 0.0, 0.0)
-        } else {
-            Vec3::new(-1.0, 0.0, 0.0)
-        };
+        let direction = Vec3::new(aim_angle.cos(), aim_angle.sin(), 0.0); // Shoot towards aim!
+        // Note: sin/cos mapping. 0 is Right (1,0). PI/2 (0,1) Up.
+        // Assuming aim_angle is standard math angle.
+        
+        // However, in our world, Y is Up. Screen Y is Down.
+        // If we calculated aim_angle using -dy, then +angle is Up.
+        // So this direction vector (cos, sin, 0) is correct for World (X, Y).
+        
         let frustum = Frustum::from_view_proj(view_proj);
         self.world.rockets.push(Rocket::new(rocket_position, direction, 10.0, &frustum));
         let time = self.start_time.elapsed().as_secs_f32();
@@ -345,6 +444,70 @@ impl GameApp {
             let tag_name = std::str::from_utf8(&t.name).unwrap_or("");
             tag_name.trim_end_matches('\0') == name
         })
+    }
+
+    fn switch_player_model(&mut self) {
+        self.current_model_index = (self.current_model_index + 1) % self.available_models.len();
+        let model_name = self.available_models[self.current_model_index];
+        
+        println!("Switching to model: {}", model_name);
+        
+        if let Some(ref mut md3_renderer) = self.md3_renderer.as_mut() {
+            md3_renderer.clear_model_cache();
+        }
+        
+        self.player_model.lower = None;
+        self.player_model.upper = None;
+        self.player_model.head = None;
+        self.player_model.lower_textures.clear();
+        self.player_model.upper_textures.clear();
+        self.player_model.head_textures.clear();
+        
+        self.player_model.lower = Self::load_model_part(&[
+            &format!("q3-resources/models/players/{}/lower.md3", model_name),
+            &format!("../q3-resources/models/players/{}/lower.md3", model_name),
+        ]);
+        self.player_model.upper = Self::load_model_part(&[
+            &format!("q3-resources/models/players/{}/upper.md3", model_name),
+            &format!("../q3-resources/models/players/{}/upper.md3", model_name),
+        ]);
+        self.player_model.head = Self::load_model_part(&[
+            &format!("q3-resources/models/players/{}/head.md3", model_name),
+            &format!("../q3-resources/models/players/{}/head.md3", model_name),
+        ]);
+        
+        if self.player_model.lower.is_none() {
+            println!("WARNING: Failed to load lower model for {}", model_name);
+        }
+        if self.player_model.upper.is_none() {
+            println!("WARNING: Failed to load upper model for {}", model_name);
+        }
+        if self.player_model.head.is_none() {
+            println!("WARNING: Failed to load head model for {}", model_name);
+        }
+        
+        self.player_model.anim_config = AnimConfig::load(model_name).ok();
+        
+        if let (Some(ref mut wgpu_renderer), Some(ref mut md3_renderer)) = 
+            (self.wgpu_renderer.as_mut(), self.md3_renderer.as_mut()) {
+            
+            if let Some(ref lower) = self.player_model.lower {
+                self.player_model.lower_textures =
+                    load_textures_for_model_static(wgpu_renderer, md3_renderer, lower, model_name, "lower");
+            }
+            if let Some(ref upper) = self.player_model.upper {
+                self.player_model.upper_textures =
+                    load_textures_for_model_static(wgpu_renderer, md3_renderer, upper, model_name, "upper");
+            }
+            if let Some(ref head) = self.player_model.head {
+                self.player_model.head_textures =
+                    load_textures_for_model_static(wgpu_renderer, md3_renderer, head, model_name, "head");
+            }
+        }
+        
+        if let Some(ref window) = self.window {
+            window.set_title(&format!("SAS2 MVP | Model: {}", model_name));
+        }
     }
 
     fn render_player<'a>(
@@ -364,14 +527,73 @@ impl GameApp {
         lights: &[(Vec3, Vec3, f32)],
         ambient: f32,
         include_weapon: bool,
+        aim_angle: f32,
+        flip_x: bool,
+        current_legs_yaw: &mut f32,
+        dt: f32,
     ) -> (Option<Orientation>, Vec<(&'a MD3Model, usize, &'a [Option<String>], Mat4)>) {
         let mut shadow_models = Vec::new();
-        let mut upper_orientation = lower_orientation;
+        
+        let pitch = if flip_x {
+            std::f32::consts::PI - aim_angle
+        } else {
+            aim_angle
+        };
+        // Normalize pitch to -PI to PI
+        let pitch = pitch.atan2(1.0).atan2(1.0) * 0.0 + pitch; // Just a dummy op, but I should normalize correctly.
+        // Actually simpler:
+        // Since we inverted aim_y in the input system (screen Y down = world Y down),
+        // we need to negate aim_angle here to make rotations work correctly
+        let pitch = if flip_x {
+            let mut p = std::f32::consts::PI - (-aim_angle);
+            while p > std::f32::consts::PI { p -= 2.0 * std::f32::consts::PI; }
+            while p < -std::f32::consts::PI { p += 2.0 * std::f32::consts::PI; }
+            p
+        } else {
+            -aim_angle  // Negate because we inverted Y in input
+        };
+
+        let effective_pitch = if flip_x { -pitch } else { pitch };
+        
+        let target_legs_yaw = if effective_pitch.abs() > 0.3 {
+            let intensity = ((effective_pitch.abs() - 0.3) / 1.2).min(1.0);
+            let raw_yaw = effective_pitch.signum() * intensity * 1.2;
+            raw_yaw.clamp(-0.5, 0.5)
+        } else {
+            0.0
+        };
+        
+        let legs_yaw_speed = 6.0;
+        let yaw_diff = target_legs_yaw - *current_legs_yaw;
+        let max_change = legs_yaw_speed * dt;
+        *current_legs_yaw += yaw_diff.clamp(-max_change, max_change);
+        
+        let legs_yaw = *current_legs_yaw;
+        let torso_yaw = legs_yaw * 0.5;
+        let torso_roll_extra = -effective_pitch * 0.25;
+        let torso_pitch = (pitch * 0.3).clamp(-0.6, 0.6);
+
+        // Inside render_player, we work in MD3 coordinate system (Z-up)
+        // The correction matrix is applied in game_transform outside this function
+        // So here: Z is up, X is forward, Y is left
+        // Yaw (turning) is around Z axis (vertical in MD3)
+        let lower_rot = Mat3::from_rotation_z(legs_yaw);
+        
+        let lower_orientation_rotated = Orientation {
+            origin: lower_orientation.origin,
+            axis: {
+                let base_mat = Mat3::from_cols(lower_orientation.axis[0], lower_orientation.axis[1], lower_orientation.axis[2]);
+                let new_mat = base_mat * lower_rot;
+                [new_mat.x_axis, new_mat.y_axis, new_mat.z_axis]
+            }
+        };
+
+        let mut upper_orientation = lower_orientation_rotated;
         let mut head_orientation: Option<Orientation> = None;
         let mut weapon_orientation_result: Option<Orientation> = None;
 
         if let Some(ref lower) = player_model.lower {
-            let md3_model_mat = scale_mat * orientation_to_mat4(&lower_orientation);
+            let md3_model_mat = scale_mat * orientation_to_mat4(&lower_orientation_rotated);
             let model_mat = game_transform * md3_model_mat;
             md3_renderer.render_model(
                 encoder,
@@ -392,7 +614,21 @@ impl GameApp {
 
             if let Some(tags) = lower.tags.get(lower_frame) {
                 if let Some(torso_tag) = Self::find_tag(tags, "tag_torso") {
-                    upper_orientation = attach_rotated_entity(&lower_orientation, torso_tag);
+                    upper_orientation = attach_rotated_entity(&lower_orientation_rotated, torso_tag);
+                    
+                    // Apply Torso Twist in MD3 coordinates
+                    // torso_yaw around Z (vertical in MD3)
+                    // torso_pitch around Y (left in MD3) - follows aim up/down
+                    // torso_roll around X (forward in MD3)
+                    let twist = Mat3::from_rotation_z(torso_yaw);
+                    let pitch_rot = Mat3::from_rotation_y(torso_pitch);
+                    let roll = Mat3::from_rotation_x(torso_roll_extra);
+                    
+                    let torso_local_rot = twist * pitch_rot * roll;
+                    
+                    let base_mat = Mat3::from_cols(upper_orientation.axis[0], upper_orientation.axis[1], upper_orientation.axis[2]);
+                    let new_mat = base_mat * torso_local_rot;
+                    upper_orientation.axis = [new_mat.x_axis, new_mat.y_axis, new_mat.z_axis];
                 }
             }
         }
@@ -420,10 +656,35 @@ impl GameApp {
             if let Some(tags) = upper.tags.get(upper_frame) {
                 if let Some(head_tag) = Self::find_tag(tags, "tag_head") {
                     head_orientation = Some(attach_rotated_entity(&upper_orientation, head_tag));
+                    
+                    // Apply Head Rotation for aiming in MD3 coordinates
+                    // In MD3: Z is up, X is forward, Y is left
+                    // Pitch (looking up/down) rotates around Y axis
+                    
+                    let head_pitch = pitch.clamp(-1.2, 1.2);
+                    let head_rot = Mat3::from_rotation_y(head_pitch);
+                    
+                    if let Some(ref mut orient) = head_orientation {
+                         let base = Mat3::from_cols(orient.axis[0], orient.axis[1], orient.axis[2]);
+                         let new_mat = base * head_rot;
+                         orient.axis = [new_mat.x_axis, new_mat.y_axis, new_mat.z_axis];
+                    }
                 }
                 if include_weapon {
                     if let Some(weapon_tag) = Self::find_tag(tags, "tag_weapon") {
                         weapon_orientation_result = Some(attach_rotated_entity(&upper_orientation, weapon_tag));
+                        
+                        // Apply Weapon Rotation (Pitch) in MD3 coordinates
+                        // Rotate around Y axis for pitch
+                        // Limit weapon pitch to avoid excessive rotation
+                        let weapon_pitch = (pitch * 0.7).clamp(-1.0, 1.0);
+                        let weapon_rot = Mat3::from_rotation_y(weapon_pitch);
+                        
+                        if let Some(ref mut orient) = weapon_orientation_result {
+                             let base = Mat3::from_cols(orient.axis[0], orient.axis[1], orient.axis[2]);
+                             let new_mat = base * weapon_rot;
+                             orient.axis = [new_mat.x_axis, new_mat.y_axis, new_mat.z_axis];
+                        }
                     }
                 }
             }
@@ -491,6 +752,10 @@ impl ApplicationHandler for GameApp {
         let mut wgpu_renderer = WgpuRenderer::new(window.clone()).block_on().unwrap();
         let mut md3_renderer =
             MD3Renderer::new(wgpu_renderer.device.clone(), wgpu_renderer.queue.clone());
+        let crosshair_renderer = sas2::engine::renderer::crosshair::Crosshair::new(
+            &wgpu_renderer.device,
+            wgpu_renderer.surface_config.format,
+        );
 
         self.player_model.lower = Self::load_model_part(&[
             "q3-resources/models/players/sarge/lower.md3",
@@ -571,6 +836,7 @@ impl ApplicationHandler for GameApp {
         self.window = Some(window.clone());
         self.wgpu_renderer = Some(wgpu_renderer);
         self.md3_renderer = Some(md3_renderer);
+        self.crosshair_renderer = Some(crosshair_renderer);
         self.create_depth();
         self.last_frame_time = Instant::now();
 
@@ -610,9 +876,42 @@ impl ApplicationHandler for GameApp {
                         KeyCode::Space => {
                             self.shoot_pressed = pressed;
                         }
+                        KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                            self.shift_pressed = pressed;
+                        }
+                        KeyCode::F5 if pressed && self.shift_pressed => {
+                            self.switch_player_model();
+                        }
                         KeyCode::Escape if pressed => event_loop.exit(),
                         _ => {}
                     }
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                // SAS-style aiming: mouse movement rotates aim direction
+                let current_pos = (position.x as f32, position.y as f32);
+                let mouse_delta = (
+                    current_pos.0 - self.last_mouse_pos.0,
+                    current_pos.1 - self.last_mouse_pos.1,
+                );
+                self.last_mouse_pos = current_pos;
+                
+                // Sensitivity settings
+                let sensitivity = 20.0;
+                let joystick_sensitivity = 0.01;
+                let m_yaw = 0.022;
+                let m_pitch = 0.022;
+                
+                // Accumulate mouse movement into aim vector
+                // Invert Y because screen Y goes down but world Y goes up
+                self.aim_x += mouse_delta.0 * joystick_sensitivity * sensitivity * m_yaw;
+                self.aim_y -= mouse_delta.1 * joystick_sensitivity * sensitivity * m_pitch; // Note the minus!
+                
+                // Normalize to keep on unit circle
+                let len = (self.aim_x * self.aim_x + self.aim_y * self.aim_y).sqrt();
+                if len > 0.0 {
+                    self.aim_x /= len;
+                    self.aim_y /= len;
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -654,7 +953,14 @@ impl ApplicationHandler for GameApp {
                 let frustum = Frustum::from_view_proj(view_proj);
 
                 if let Some(player) = self.world.players.get_mut(self.local_player_id as usize) {
-                    player.update(dt, self.move_left, self.move_right, self.jump_pressed, self.crouch_pressed, self.world.map.ground_y);
+                    // Calculate aim angle
+                    let ground_y = self.world.map.ground_y;
+                    let model_bottom_offset = 0.9;
+                    let render_y = ground_y + model_bottom_offset + player.y;
+                    // SAS-style aiming: aim_angle comes from normalized aim vector
+                    let aim_angle = self.aim_y.atan2(self.aim_x);
+                    
+                    player.update(dt, self.move_left, self.move_right, self.jump_pressed, self.crouch_pressed, self.world.map.ground_y, aim_angle);
                 }
                 
                 self.world.update(dt, &frustum);
@@ -666,7 +972,15 @@ impl ApplicationHandler for GameApp {
                 };
                 let player_x = player.x;
                 let player_y = player.y;
-                let player_facing_right = player.facing_right;
+                let player_aim_angle = player.aim_angle;
+                // Calculate facing from aim_angle
+                let normalized_angle = if player.aim_angle > std::f32::consts::PI {
+                    player.aim_angle - 2.0 * std::f32::consts::PI
+                } else {
+                    player.aim_angle
+                };
+                let player_facing_right = normalized_angle.abs() < std::f32::consts::FRAC_PI_2;
+
                 let player_is_moving = player.is_moving;
                 let player_animation_time = player.animation_time;
                 let player_state = player.state;
@@ -876,25 +1190,34 @@ impl ApplicationHandler for GameApp {
                 let scale_mat = Mat4::from_scale(Vec3::splat(scale));
                 let surface_format = wgpu_renderer.surface_config.format;
 
-                // Render Local Player
-                let correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
-                let facing_angle = if player_facing_right {
-                    0.0
-                } else {
-                    std::f32::consts::PI
-                };
-                let game_rotation_y = Mat3::from_rotation_y(facing_angle);
-                let md3_rotation = game_rotation_y * correction;
-                let lower_axis = axis_from_mat3(md3_rotation);
-                let md3_lower_orientation = Orientation {
+                // Render Player
+                
+                let lower_orientation = Orientation {
                     origin: Vec3::ZERO,
-                    axis: lower_axis,
+                    axis: axis_from_mat3(Mat3::IDENTITY),
                 };
+                
+                // Determine flip_x based on aiming
+                // If aiming left (PI), flip_x = true.
+                let flip_x = !player_facing_right;
+                
+                let player_model_yaw = player.model_yaw;
+                
+                // MD3 models use Z-up coordinate system (X=forward, Y=left, Z=up)
+                // Our world uses Y-up coordinate system (X=right, Y=up, Z=forward)
+                // We need to rotate the model -90° around X axis to convert Z-up to Y-up
+                let md3_correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+                
+                // Then rotate around Y axis (which is now vertical after correction) for facing direction
+                let facing_rotation = Mat3::from_rotation_y(player_model_yaw);
+                
+                let combined_rotation = facing_rotation * md3_correction;
+                
                 let ground_y = self.world.map.ground_y;
                 let model_bottom_offset = 0.9;
                 let render_y = ground_y + model_bottom_offset + player_y;
                 let game_translation = Mat4::from_translation(Vec3::new(player_x, render_y, 0.0));
-                let game_rotation = Mat4::from_mat3(game_rotation_y);
+                let game_rotation = Mat4::from_mat3(combined_rotation);
                 let game_transform = game_translation * game_rotation;
 
                 let (weapon_orientation, mut shadow_models) = Self::render_player(
@@ -905,8 +1228,8 @@ impl ApplicationHandler for GameApp {
                     surface_format,
                     player_model,
                     game_transform,
-                    scale_mat,
-                    md3_lower_orientation,
+                    Mat4::from_scale(Vec3::splat(0.04)),
+                    lower_orientation,
                     lower_frame,
                     upper_frame,
                     view_proj,
@@ -914,25 +1237,33 @@ impl ApplicationHandler for GameApp {
                     &all_lights,
                     lighting.ambient,
                     true,
+                    player_aim_angle,
+                    flip_x,
+                    &mut self.current_legs_yaw,
+                    dt,
+                );
+
+                let weapon_world_pos = Self::compute_weapon_world_position(
+                    weapon_orientation.as_ref(),
+                    player_x,
+                    player_y,
+                    player.model_yaw,
+                    self.world.map.ground_y,
                 );
 
                 // Render Player 2 (Static dummy for now, but should ideally come from World)
                 // For MVP refactor, keeping it as static dummy
-                let player2_game_rotation_y = Mat3::from_rotation_y(std::f32::consts::PI);
-                let player2_md3_rotation = player2_game_rotation_y * correction;
-                let player2_lower_axis = axis_from_mat3(player2_md3_rotation);
-                let player2_md3_lower_orientation = Orientation {
-                    origin: Vec3::ZERO,
-                    axis: player2_lower_axis,
-                };
                 let ground_y = self.world.map.ground_y;
                 let model_bottom_offset = 0.9;
                 let player2_y = ground_y + model_bottom_offset;
                 let player2_game_translation = Mat4::from_translation(Vec3::new(10.0, player2_y, 0.0));
-                let player2_game_rotation = Mat4::from_mat3(player2_game_rotation_y);
+                let md3_correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+                let facing_rotation = Mat3::from_rotation_y(std::f32::consts::PI);
+                let player2_combined_rotation = facing_rotation * md3_correction;
+                let player2_game_rotation = Mat4::from_mat3(player2_combined_rotation);
                 let player2_game_transform = player2_game_translation * player2_game_rotation;
 
-                let (_, player2_shadow_models) = Self::render_player(
+                let (player2_weapon_orientation, player2_shadow_models) = Self::render_player(
                     &mut encoder,
                     &view,
                     depth_view,
@@ -940,8 +1271,8 @@ impl ApplicationHandler for GameApp {
                     surface_format,
                     player2_model,
                     player2_game_transform,
-                    scale_mat,
-                    player2_md3_lower_orientation,
+                    Mat4::from_scale(Vec3::splat(0.04)),
+                    lower_orientation,
                     player2_lower_frame,
                     player2_upper_frame,
                     view_proj,
@@ -949,6 +1280,10 @@ impl ApplicationHandler for GameApp {
                     &all_lights,
                     lighting.ambient,
                     false,
+                    0.0,
+                    true,
+                    &mut self.player2_legs_yaw,
+                    dt,
                 );
                 shadow_models.extend(player2_shadow_models);
 
@@ -962,10 +1297,11 @@ impl ApplicationHandler for GameApp {
                         }
                         
                         let rocket_scale = 0.05;
-                        let correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
-                        let rocket_rotation = Mat3::from_rotation_y(
+                        let md3_correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+                        let facing_rotation = Mat3::from_rotation_y(
                             if rocket.velocity.x > 0.0 { 0.0 } else { std::f32::consts::PI }
-                        ) * correction;
+                        );
+                        let rocket_rotation = facing_rotation * md3_correction;
                         
                         let translation = Mat4::from_translation(rocket.position);
                         let rotation = Mat4::from_mat3(rocket_rotation);
@@ -1051,10 +1387,39 @@ impl ApplicationHandler for GameApp {
                 let render_time = frame_start.elapsed();
                 
                 wgpu_renderer.queue.submit(Some(encoder.finish()));
+                
+                if let Some(crosshair_renderer) = &self.crosshair_renderer {
+                    const CROSSHAIR_DISTANCE: f32 = 4.0;
+                    let crosshair_world_x = weapon_world_pos.x + self.aim_x * CROSSHAIR_DISTANCE;
+                    let crosshair_world_y = weapon_world_pos.y + self.aim_y * CROSSHAIR_DISTANCE;
+                    
+                    let crosshair_world_pos = Vec3::new(crosshair_world_x, crosshair_world_y, 0.0);
+                    let clip_pos = view_proj * glam::Vec4::new(crosshair_world_pos.x, crosshair_world_pos.y, crosshair_world_pos.z, 1.0);
+                    let ndc = Vec3::new(clip_pos.x, clip_pos.y, clip_pos.z) / clip_pos.w;
+                    let screen_x = (ndc.x * 0.5 + 0.5) * width as f32;
+                    let screen_y = (1.0 - (ndc.y * 0.5 + 0.5)) * height as f32;
+                    
+                    let mut encoder = wgpu_renderer.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Crosshair Encoder"),
+                    });
+                    
+                    crosshair_renderer.render(
+                        &mut encoder,
+                        &view,
+                        &wgpu_renderer.queue,
+                        screen_x,
+                        screen_y,
+                        width,
+                        height,
+                    );
+                    
+                    wgpu_renderer.queue.submit(Some(encoder.finish()));
+                }
+                
                 wgpu_renderer.end_frame(frame);
                 
                 if should_shoot {
-                    self.shoot_rocket(view_proj, weapon_orientation);
+                    self.shoot_rocket(view_proj, weapon_orientation, player_aim_angle);
                 }
                 
                 let total_time = frame_start.elapsed();
