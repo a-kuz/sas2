@@ -22,7 +22,7 @@ pub struct CachedBuffers {
 pub fn get_or_create_buffers(
     buffer_cache: &mut HashMap<BufferCacheKey, CachedBuffers>,
     device: &Device,
-    model: &MD3Model,ф
+    model: &MD3Model,
     mesh_idx: usize,
     frame_idx: usize,
 ) -> Option<(Arc<Buffer>, Arc<Buffer>, u32)> {
