@@ -1243,13 +1243,6 @@ impl ApplicationHandler for GameApp {
                     dt,
                 );
 
-                let weapon_world_pos = Self::compute_weapon_world_position(
-                    weapon_orientation.as_ref(),
-                    player_x,
-                    player_y,
-                    player.model_yaw,
-                    self.world.map.ground_y,
-                );
 
                 // Render Player 2 (Static dummy for now, but should ideally come from World)
                 // For MVP refactor, keeping it as static dummy
@@ -1390,8 +1383,12 @@ impl ApplicationHandler for GameApp {
                 
                 if let Some(crosshair_renderer) = &self.crosshair_renderer {
                     const CROSSHAIR_DISTANCE: f32 = 4.0;
-                    let crosshair_world_x = weapon_world_pos.x + self.aim_x * CROSSHAIR_DISTANCE;
-                    let crosshair_world_y = weapon_world_pos.y + self.aim_y * CROSSHAIR_DISTANCE;
+                    
+                    let player_center_y = ground_y + model_bottom_offset + player_y + 0.5;
+                    let player_center = Vec3::new(player_x, player_center_y, 0.0);
+                    
+                    let crosshair_world_x = player_center.x + self.aim_x * CROSSHAIR_DISTANCE;
+                    let crosshair_world_y = player_center.y + self.aim_y * CROSSHAIR_DISTANCE;
                     
                     let crosshair_world_pos = Vec3::new(crosshair_world_x, crosshair_world_y, 0.0);
                     let clip_pos = view_proj * glam::Vec4::new(crosshair_world_pos.x, crosshair_world_pos.y, crosshair_world_pos.z, 1.0);
