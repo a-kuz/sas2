@@ -778,7 +778,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 pub const SHADOW_VOLUME_SHADER: &str = r#"
 struct VertexInput {
     @location(0) position: vec3<f32>,
-    @location(1) extrude_dir: vec3<f32>,
+    @location(1) extrude: f32,
 }
 
 struct VertexOutput {
@@ -801,12 +801,10 @@ var<uniform> uniforms: Uniforms;
 fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
     
-    let extrude_amount = length(input.extrude_dir);
-    
     var world_pos: vec3<f32>;
-    if (extrude_amount > 0.5) {
+    if (input.extrude > 0.5) {
         let light_to_vertex = input.position - uniforms.light_pos.xyz;
-        let extruded_pos = input.position + normalize(light_to_vertex) * uniforms.extrude_distance;
+        let extruded_pos = input.position + normalize(light_to_vertex) * input.extrude;
         world_pos = extruded_pos;
     } else {
         world_pos = input.position;
@@ -875,5 +873,41 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(_input: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(0.0, 0.0, 0.0, 0.75);
+}
+"#;
+
+pub const COORDINATE_GRID_SHADER: &str = r#"
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) normal: vec3<f32>,
+}
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+}
+
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+    model: mat4x4<f32>,
+}
+
+@group(0) @binding(0)
+var<uniform> uniforms: Uniforms;
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    let world_pos = uniforms.model * vec4<f32>(input.position, 1.0);
+    output.clip_position = uniforms.view_proj * world_pos;
+    output.color = input.color;
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return input.color;
 }
 "#;

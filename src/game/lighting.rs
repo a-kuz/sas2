@@ -96,7 +96,7 @@ impl LightingParams {
     pub fn new() -> Self {
         Self {
             lights: vec![
-                Light::new(Vec3::new(-10.0, 2.0, 2.0), Vec3::new(1.6, 1.6, 2.7), 35.0),
+                Light::new(Vec3::new(-250.0, 50.0, 50.0), Vec3::new(1.6, 1.6, 2.7), 875.0),
                 
             ],
             ambient: 0.015,

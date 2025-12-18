@@ -10,8 +10,8 @@ impl Camera {
     pub fn new() -> Self {
         Self {
             x: 0.0,
-            y: 5.0,
-            z: 35.0,
+            y: 59.0,
+            z: 500.0,
         }
     }
 

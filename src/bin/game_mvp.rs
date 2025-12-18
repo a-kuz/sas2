@@ -17,12 +17,13 @@ use sas2::engine::loader::{load_textures_for_model_static, load_weapon_textures_
 use sas2::engine::math::{axis_from_mat3, attach_rotated_entity, orientation_to_mat4, Orientation, Frustum};
 use sas2::engine::md3::MD3Model;
 use sas2::engine::renderer::{MD3Renderer, WgpuRenderer};
+use sas2::render::TextRenderer;
 
 use sas2::game::world::World;
 use sas2::game::camera::Camera;
 use sas2::game::lighting::{LightingParams, Light};
 // use sas2::game::player::Player;
-use sas2::game::weapon::Rocket;
+use sas2::game::weapons::Rocket;
 
 struct PlayerModel {
     lower: Option<MD3Model>,
@@ -57,6 +58,7 @@ struct GameApp {
     wgpu_renderer: Option<WgpuRenderer>,
     md3_renderer: Option<MD3Renderer>,
     crosshair_renderer: Option<sas2::engine::renderer::crosshair::Crosshair>,
+    text_renderer: Option<TextRenderer>,
     player_model: PlayerModel,
     player2_model: PlayerModel,
     rocket_model: Option<MD3Model>,
@@ -116,6 +118,7 @@ impl GameApp {
             wgpu_renderer: None,
             md3_renderer: None,
             crosshair_renderer: None,
+            text_renderer: None,
             player_model: PlayerModel::new(),
             player2_model: PlayerModel::new(),
             rocket_model: None,
@@ -325,27 +328,24 @@ impl GameApp {
         ground_y: f32,
     ) -> Vec3 {
         if let Some(weapon_orient) = weapon_orientation {
-            let scale = 0.04;
             let md3_correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
             let facing_rotation = Mat3::from_rotation_y(model_yaw);
             let combined_rotation = facing_rotation * md3_correction;
             
-            let model_bottom_offset = 0.9;
+            let model_bottom_offset = 0.025714285714285714;
             let render_y = ground_y + model_bottom_offset + player_y;
             let game_translation = Mat4::from_translation(Vec3::new(player_x, render_y, 0.0));
             let game_rotation = Mat4::from_mat3(combined_rotation);
             let game_transform = game_translation * game_rotation;
-            let scale_mat = Mat4::from_scale(Vec3::splat(scale));
             
-            let weapon_local_pos = weapon_orient.origin;
-            let weapon_scaled = scale_mat.transform_point3(weapon_local_pos);
-            let weapon_world = game_transform.transform_point3(weapon_scaled);
+            let weapon_local_pos = weapon_orient.origin * 0.04;
+            let weapon_world = game_transform.transform_point3(weapon_local_pos);
             
             weapon_world
         } else {
-            let model_bottom_offset = 0.9;
+            let model_bottom_offset = 0.025714285714285714;
             let render_y = ground_y + model_bottom_offset + player_y;
-            Vec3::new(player_x, render_y + 0.5, 0.0)
+            Vec3::new(player_x, render_y + 0.014285714285714285, 0.0)
         }
     }
 
@@ -356,38 +356,6 @@ impl GameApp {
         };
 
         let rocket_position = if let Some(weapon_orient) = weapon_orientation {
-            let scale = 0.04;
-            // Use aim_angle for rotation instead of just facing_right
-            // But weapon orientation already includes some rotation from torso/weapon_bone?
-            // render_player calculates orientation based on aim_angle.
-            // So weapon_orient should be correct in world space?
-            // BUT render_player applies transformations to MD3 model matrix.
-            // weapon_orient returned by render_player IS in local space relative to upper body?
-            // No, render_player returns local orientation attached to upper?
-            // "weapon_orientation_result = Some(attach_rotated_entity(&upper_orientation, weapon_tag));"
-            // upper_orientation is attached to lower_orientation.
-            // lower_orientation is attached to world (but computed in render_player).
-            
-            // Wait, render_player logic:
-            // lower_orientation passed in.
-            // upper_orientation attached to lower.
-            // weapon_orientation attached to upper.
-            // So weapon_orientation is relative to lower_orientation's base.
-            
-            // In shoot_rocket implementation:
-            // "let facing_angle = if player.facing_right { 0.0 } else { std::f32::consts::PI };"
-            // "let game_rotation_y = Mat3::from_rotation_y(facing_angle);"
-            // "let game_transform = game_translation * game_rotation;"
-            
-            // If we change render_player to handle rotation manually, we need to replicate that here or receive the full world matrix?
-            // For now let's stick to what was there but use aim_angle for initial direction if needed?
-            // Actually, calculating proper muzzle position is hard without the full transform chain.
-            // Let's assume render_player still works similarly but we might need to adjust "game_rotation_y" if we change how player is rotated.
-            
-            // If render_player does "complex rotations", it modifies how the model sits in world.
-            // We should use the same logic here or refactor.
-            // For MVP, since we only change how model is RENDERED (visuals), the actual logic for "direction" is simple.
-            
             let facing_angle = if player.facing_right { 0.0 } else { std::f32::consts::PI };
             let md3_correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
             let facing_rotation = Mat3::from_rotation_y(facing_angle);
@@ -395,32 +363,26 @@ impl GameApp {
             
             let ground_y = self.world.map.ground_y;
             let model_bottom_offset = 0.9;
-            let render_y = ground_y + model_bottom_offset + player.y; // approximate
+            let render_y = ground_y + model_bottom_offset + player.y;
             let game_translation = Mat4::from_translation(Vec3::new(player.x, render_y, 0.0));
-            
-            // Note: If we implement complex rotations (leaning), the barrel position will change.
-            // Ideally we need the final world matrix of the weapon tag.
-            // For now, let's keep it approximate or we might break shooting origin.
             
             let game_rotation = Mat4::from_mat3(combined_rotation);
             let game_transform = game_translation * game_rotation;
-            let scale_mat = Mat4::from_scale(Vec3::splat(scale));
             
-            let barrel_offset = Vec3::new(25.0, 0.0, 5.0);
-            let barrel_local_pos = weapon_orient.origin + 
+            let barrel_offset = Vec3::new(1.0, 0.0, 0.2);
+            let barrel_local_pos = weapon_orient.origin * 0.04 + 
                 weapon_orient.axis[0] * barrel_offset.x +
                 weapon_orient.axis[1] * barrel_offset.y +
                 weapon_orient.axis[2] * barrel_offset.z;
             
-            let barrel_scaled = scale_mat.transform_point3(barrel_local_pos);
-            let barrel_world = game_transform.transform_point3(barrel_scaled);
+            let barrel_world = game_transform.transform_point3(barrel_local_pos);
             
             barrel_world
         } else {
             let ground_y = self.world.map.ground_y;
             let model_bottom_offset = 0.9;
             let render_y = ground_y + model_bottom_offset + player.y;
-            Vec3::new(player.x, render_y + 0.5, 0.0)
+            Vec3::new(player.x, render_y + 0.014285714285714285, 0.0)
         };
 
         let direction = Vec3::new(aim_angle.cos(), aim_angle.sin(), 0.0); // Shoot towards aim!
@@ -432,7 +394,7 @@ impl GameApp {
         // So this direction vector (cos, sin, 0) is correct for World (X, Y).
         
         let frustum = Frustum::from_view_proj(view_proj);
-        self.world.rockets.push(Rocket::new(rocket_position, direction, 10.0, &frustum));
+        self.world.rockets.push(Rocket::new(rocket_position, direction, sas2::game::constants::ROCKET_SPEED, &frustum, self.local_player_id));
         let time = self.start_time.elapsed().as_secs_f32();
         self.last_shot_time = time;
         self.is_shooting = true;
@@ -593,7 +555,7 @@ impl GameApp {
         let mut weapon_orientation_result: Option<Orientation> = None;
 
         if let Some(ref lower) = player_model.lower {
-            let md3_model_mat = scale_mat * orientation_to_mat4(&lower_orientation_rotated);
+            let md3_model_mat = orientation_to_mat4(&lower_orientation_rotated);
             let model_mat = game_transform * md3_model_mat;
             md3_renderer.render_model(
                 encoder,
@@ -634,7 +596,7 @@ impl GameApp {
         }
 
         if let Some(ref upper) = player_model.upper {
-            let md3_model_mat = scale_mat * orientation_to_mat4(&upper_orientation);
+            let md3_model_mat = orientation_to_mat4(&upper_orientation);
             let model_mat = game_transform * md3_model_mat;
             md3_renderer.render_model(
                 encoder,
@@ -691,7 +653,7 @@ impl GameApp {
         }
 
         if let (Some(ref head), Some(head_orient)) = (&player_model.head, head_orientation) {
-            let md3_model_mat = scale_mat * orientation_to_mat4(&head_orient);
+            let md3_model_mat = orientation_to_mat4(&head_orient);
             let model_mat = game_transform * md3_model_mat;
             md3_renderer.render_model(
                 encoder,
@@ -713,7 +675,7 @@ impl GameApp {
 
         if include_weapon {
             if let (Some(ref weapon), Some(weapon_orient)) = (&player_model.weapon, weapon_orientation_result) {
-                let md3_model_mat = scale_mat * orientation_to_mat4(&weapon_orient);
+                let md3_model_mat = orientation_to_mat4(&weapon_orient);
                 let model_mat = game_transform * md3_model_mat;
                 md3_renderer.render_model(
                     encoder,
@@ -754,6 +716,11 @@ impl ApplicationHandler for GameApp {
             MD3Renderer::new(wgpu_renderer.device.clone(), wgpu_renderer.queue.clone());
         let crosshair_renderer = sas2::engine::renderer::crosshair::Crosshair::new(
             &wgpu_renderer.device,
+            wgpu_renderer.surface_config.format,
+        );
+        let text_renderer = TextRenderer::new(
+            wgpu_renderer.device.clone(),
+            wgpu_renderer.queue.clone(),
             wgpu_renderer.surface_config.format,
         );
 
@@ -837,6 +804,7 @@ impl ApplicationHandler for GameApp {
         self.wgpu_renderer = Some(wgpu_renderer);
         self.md3_renderer = Some(md3_renderer);
         self.crosshair_renderer = Some(crosshair_renderer);
+        self.text_renderer = Some(text_renderer);
         self.create_depth();
         self.last_frame_time = Instant::now();
 
@@ -918,6 +886,11 @@ impl ApplicationHandler for GameApp {
                 let now = Instant::now();
                 let dt = now.duration_since(self.last_frame_time).as_secs_f32();
                 self.last_frame_time = now;
+                
+                if self.frame_count % 60 == 0 {
+                    println!("RedrawRequested: frame_count={}, text_renderer.is_some={}", 
+                        self.frame_count, self.text_renderer.is_some());
+                }
 
                 self.update_fps_counter(now);
 
@@ -1186,8 +1159,6 @@ impl ApplicationHandler for GameApp {
                     lighting.ambient,
                 );
 
-                let scale = 0.04;
-                let scale_mat = Mat4::from_scale(Vec3::splat(scale));
                 let surface_format = wgpu_renderer.surface_config.format;
 
                 // Render Player
@@ -1214,7 +1185,7 @@ impl ApplicationHandler for GameApp {
                 let combined_rotation = facing_rotation * md3_correction;
                 
                 let ground_y = self.world.map.ground_y;
-                let model_bottom_offset = 0.9;
+                let model_bottom_offset = 0.025714285714285714;
                 let render_y = ground_y + model_bottom_offset + player_y;
                 let game_translation = Mat4::from_translation(Vec3::new(player_x, render_y, 0.0));
                 let game_rotation = Mat4::from_mat3(combined_rotation);
@@ -1228,7 +1199,7 @@ impl ApplicationHandler for GameApp {
                     surface_format,
                     player_model,
                     game_transform,
-                    Mat4::from_scale(Vec3::splat(0.04)),
+                    Mat4::IDENTITY,
                     lower_orientation,
                     lower_frame,
                     upper_frame,
@@ -1247,9 +1218,9 @@ impl ApplicationHandler for GameApp {
                 // Render Player 2 (Static dummy for now, but should ideally come from World)
                 // For MVP refactor, keeping it as static dummy
                 let ground_y = self.world.map.ground_y;
-                let model_bottom_offset = 0.9;
+                let model_bottom_offset = 0.025714285714285714;
                 let player2_y = ground_y + model_bottom_offset;
-                let player2_game_translation = Mat4::from_translation(Vec3::new(10.0, player2_y, 0.0));
+                let player2_game_translation = Mat4::from_translation(Vec3::new(0.2857142857142857, player2_y, 0.0));
                 let md3_correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
                 let facing_rotation = Mat3::from_rotation_y(std::f32::consts::PI);
                 let player2_combined_rotation = facing_rotation * md3_correction;
@@ -1264,7 +1235,7 @@ impl ApplicationHandler for GameApp {
                     surface_format,
                     player2_model,
                     player2_game_transform,
-                    Mat4::from_scale(Vec3::splat(0.04)),
+                    Mat4::IDENTITY,
                     lower_orientation,
                     player2_lower_frame,
                     player2_upper_frame,
@@ -1289,7 +1260,6 @@ impl ApplicationHandler for GameApp {
                             continue;
                         }
                         
-                        let rocket_scale = 0.05;
                         let md3_correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
                         let facing_rotation = Mat3::from_rotation_y(
                             if rocket.velocity.x > 0.0 { 0.0 } else { std::f32::consts::PI }
@@ -1298,8 +1268,7 @@ impl ApplicationHandler for GameApp {
                         
                         let translation = Mat4::from_translation(rocket.position);
                         let rotation = Mat4::from_mat3(rocket_rotation);
-                        let scale_mat = Mat4::from_scale(Vec3::splat(rocket_scale));
-                        let model_mat = translation * rotation * scale_mat;
+                        let model_mat = translation * rotation;
                         
                         md3_renderer.render_model(
                             &mut encoder,
@@ -1377,14 +1346,64 @@ impl ApplicationHandler for GameApp {
                 //     surface_format,
                 // );
 
+                println!("Before text rendering check, text_renderer is_some: {}", self.text_renderer.is_some());
+                if let Some(ref text_renderer) = self.text_renderer {
+                    println!("Rendering text TEST at (200, 200)");
+                    text_renderer.render_text(
+                        &mut encoder,
+                        &view,
+                        "TEST",
+                        200.0,
+                        200.0,
+                        48.0,
+                        [1.0, 1.0, 0.0, 1.0],
+                        width,
+                        height,
+                    );
+                    
+                    let ground_y = self.world.map.ground_y;
+                    let model_bottom_offset = 0.9;
+                    let player_center_y = ground_y + model_bottom_offset + player_y + 0.014285714285714285;
+                    let text_world_pos = Vec3::new(player_x, player_center_y + 2.0, 0.0);
+                    let clip_pos = view_proj * glam::Vec4::new(text_world_pos.x, text_world_pos.y, text_world_pos.z, 1.0);
+                    println!("Text world pos: {:?}, clip_pos: {:?}", text_world_pos, clip_pos);
+                    if clip_pos.w > 0.0 {
+                        let ndc = Vec3::new(clip_pos.x, clip_pos.y, clip_pos.z) / clip_pos.w;
+                        println!("NDC: {:?}", ndc);
+                        if ndc.x.abs() < 1.0 && ndc.y.abs() < 1.0 {
+                            let screen_x = (ndc.x * 0.5 + 0.5) * width as f32;
+                            let screen_y = (1.0 - (ndc.y * 0.5 + 0.5)) * height as f32;
+                            println!("Rendering text PLAYER at screen ({}, {})", screen_x, screen_y);
+                            
+                            text_renderer.render_text(
+                                &mut encoder,
+                                &view,
+                                "PLAYER",
+                                screen_x,
+                                screen_y,
+                                32.0,
+                                [1.0, 1.0, 0.0, 1.0],
+                                width,
+                                height,
+                            );
+                        } else {
+                            println!("NDC out of bounds");
+                        }
+                    } else {
+                        println!("clip_pos.w <= 0.0");
+                    }
+                } else {
+                    println!("text_renderer is None!");
+                }
+
                 let render_time = frame_start.elapsed();
                 
                 wgpu_renderer.queue.submit(Some(encoder.finish()));
-                
+
                 if let Some(crosshair_renderer) = &self.crosshair_renderer {
                     const CROSSHAIR_DISTANCE: f32 = 4.0;
                     
-                    let player_center_y = ground_y + model_bottom_offset + player_y + 0.5;
+                    let player_center_y = ground_y + model_bottom_offset + player_y + 0.014285714285714285;
                     let player_center = Vec3::new(player_x, player_center_y, 0.0);
                     
                     let crosshair_world_x = player_center.x + self.aim_x * CROSSHAIR_DISTANCE;

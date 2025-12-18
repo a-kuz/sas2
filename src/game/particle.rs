@@ -11,7 +11,7 @@ pub struct SmokeParticle {
 
 impl SmokeParticle {
     pub fn new(position: Vec3, start_time: f32) -> Self {
-        let scale = 0.04;
+        let scale = 0.3;
         let initial_size = 24.0 * scale * 0.5;
         Self {
             position,
@@ -73,7 +73,7 @@ impl FlameParticle {
             position,
             lifetime: 0.0,
             max_lifetime: 0.15,
-            size: 0.3,
+            size: 2.0,
             texture_index,
         }
     }
@@ -92,7 +92,7 @@ impl FlameParticle {
         self.position += rocket_velocity * dt * 0.3 + dir * 0.5 * dt;
         
         let size_curve = 1.0 - life_ratio * 0.5;
-        self.size = 0.3 * size_curve;
+        self.size = 2.0 * size_curve;
         
         self.lifetime < self.max_lifetime
     }

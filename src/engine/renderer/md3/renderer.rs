@@ -453,7 +453,7 @@ impl MD3Renderer {
         self.create_ground_texture();
 
         let wall_size = 500.0;
-        let wall_height = 50.0;
+        let wall_height = 500.0;
         let wall_z = -3.0;
         let wall_bottom = 0.0;
         let wall_vertices = vec![

@@ -268,4 +268,54 @@ impl MD3Model {
             meshes,
         })
     }
+
+    pub fn get_min_z(&self, frame: usize) -> f32 {
+        let scale = 1.0 / 64.0;
+        let mut min_z = f32::MAX;
+        for mesh in &self.meshes {
+            if frame < mesh.vertices.len() {
+                for vertex in &mesh.vertices[frame] {
+                    let z = vertex.vertex[2] as f32 * scale;
+                    min_z = min_z.min(z);
+                }
+            }
+        }
+        if min_z == f32::MAX {
+            0.0
+        } else {
+            min_z
+        }
+    }
+
+    pub fn get_bounds(&self, frame: usize) -> (f32, f32, f32, f32, f32, f32) {
+        let scale = 1.0 / 64.0;
+        let mut min_x = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut min_y = f32::MAX;
+        let mut max_y = f32::MIN;
+        let mut min_z = f32::MAX;
+        let mut max_z = f32::MIN;
+        
+        for mesh in &self.meshes {
+            if frame < mesh.vertices.len() {
+                for vertex in &mesh.vertices[frame] {
+                    let x = vertex.vertex[0] as f32 * scale;
+                    let y = vertex.vertex[1] as f32 * scale;
+                    let z = vertex.vertex[2] as f32 * scale;
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                    min_z = min_z.min(z);
+                    max_z = max_z.max(z);
+                }
+            }
+        }
+        
+        if min_x == f32::MAX {
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        } else {
+            (min_x, max_x, min_y, max_y, min_z, max_z)
+        }
+    }
 }
