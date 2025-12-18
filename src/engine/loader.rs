@@ -75,10 +75,17 @@ pub fn load_textures_for_model_static(
         
         let mut texture_loaded = false;
         if let Some(ref path) = texture_path {
-            let mut alt_paths = vec![
-                path.clone(),
-                format!("../{}", path),
-            ];
+            let mut alt_paths = vec![];
+            
+            if path.ends_with(".TGA") {
+                let png_path = path.replace(".TGA", ".png");
+                alt_paths.push(png_path.clone());
+                alt_paths.push(format!("../{}", png_path));
+            }
+            
+            alt_paths.push(path.clone());
+            alt_paths.push(format!("../{}", path));
+            
             if path.ends_with(".png") {
                 alt_paths.push(path.replace(".png", ".jpg"));
                 alt_paths.push(path.replace(".png", ".tga"));
@@ -94,6 +101,9 @@ pub fn load_textures_for_model_static(
                 alt_paths.push(path.replace(".tga", ".jpg"));
                 alt_paths.push(format!("../{}", path.replace(".tga", ".png")));
                 alt_paths.push(format!("../{}", path.replace(".tga", ".jpg")));
+            } else if path.ends_with(".TGA") {
+                alt_paths.push(path.replace(".TGA", ".jpg"));
+                alt_paths.push(format!("../{}", path.replace(".TGA", ".jpg")));
             }
             
             for alt_path in alt_paths {
@@ -150,8 +160,8 @@ pub fn load_textures_for_model_static(
                                 sampler,
                             };
 
-                            md3_renderer.load_texture(&alt_path, wgpu_tex);
-                            println!("Loaded texture: {} for mesh: {}", alt_path, mesh_name);
+                            md3_renderer.load_texture(path, wgpu_tex);
+                            println!("Loaded texture: {} for mesh: {} (from file: {})", path, mesh_name, alt_path);
                             texture_loaded = true;
                             break;
                         }

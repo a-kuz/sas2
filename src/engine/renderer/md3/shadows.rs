@@ -272,8 +272,8 @@ impl ShadowRenderer {
         light_pos: Vec3,
         plane_normal: Vec3,
         plane_d: f32,
+        eps: f32,
     ) -> Vec<[f32; 3]> {
-        let eps = 0.002;
         let mut out = Vec::new();
         for tri in triangles {
             let mut projected = Vec::new();
@@ -348,8 +348,8 @@ impl ShadowRenderer {
                 continue;
             }
 
-            let ground_proj = Self::project_triangles_to_plane(&triangles, *light_pos, Vec3::new(0.0, 1.0, 0.0), 0.0);
-            let wall_proj = Self::project_triangles_to_plane(&triangles, *light_pos, Vec3::new(0.0, 0.0, 1.0), 3.0);
+            let ground_proj = Self::project_triangles_to_plane(&triangles, *light_pos, Vec3::new(0.0, 1.0, 0.0), 0.0, 0.002);
+            let wall_proj = Self::project_triangles_to_plane(&triangles, *light_pos, Vec3::new(0.0, 0.0, 1.0), 3.0, 0.01);
 
             let mut all_proj = Vec::new();
             all_proj.extend(ground_proj);

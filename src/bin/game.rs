@@ -111,6 +111,14 @@ impl GameApp {
     fn new() -> Self {
         let now = Instant::now();
         let mut world = World::new();
+        
+        if let Ok(map) = sas2::game::map::Map::load_from_file("0-arena") {
+            println!("Loaded map: {}x{} tiles", map.width, map.height);
+            world.map = map;
+        } else {
+            println!("Failed to load map, using default");
+        }
+        
         let local_player_id = world.add_player();
         
         Self {
@@ -766,6 +774,9 @@ impl ApplicationHandler for GameApp {
         let mut wgpu_renderer = WgpuRenderer::new(window.clone()).block_on().unwrap();
         let mut md3_renderer =
             MD3Renderer::new(wgpu_renderer.device.clone(), wgpu_renderer.queue.clone());
+        
+        md3_renderer.load_map_tiles(&self.world.map);
+        
         let crosshair_renderer = sas2::engine::renderer::crosshair::Crosshair::new(
             &wgpu_renderer.device,
             wgpu_renderer.surface_config.format,
@@ -1216,32 +1227,16 @@ impl ApplicationHandler for GameApp {
                 let mut all_lights = static_lights.clone();
                 all_lights.extend(dynamic_lights_data.iter().copied());
 
-                md3_renderer.render_ground(
-                    &mut encoder,
-                    &view,
-                    depth_view,
-                    view_proj,
-                    camera_pos,
-                    &all_lights,
-                    lighting.ambient,
-                );
-
-                md3_renderer.render_wall(
-                    &mut encoder,
-                    &view,
-                    depth_view,
-                    view_proj,
-                    camera_pos,
-                    &all_lights,
-                    lighting.ambient,
-                );
-
                 let surface_format = wgpu_renderer.surface_config.format;
-                md3_renderer.render_coordinate_grid(
+
+                md3_renderer.render_tiles(
                     &mut encoder,
                     &view,
                     depth_view,
                     view_proj,
+                    camera_pos,
+                    &all_lights,
+                    lighting.ambient,
                     surface_format,
                 );
 
@@ -1478,62 +1473,6 @@ impl ApplicationHandler for GameApp {
                     let mut text_encoder = wgpu_renderer.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("Text Encoder"),
                     });
-
-                    let wall_size = 12500.0;
-                    let wall_height = 2500.0;
-                    let wall_z = -2.9;
-                    let wall_bottom = 0.0;
-                    let major_step = 10.0;
-
-                    for x in (-wall_size as i32..=wall_size as i32).step_by(major_step as usize) {
-                        let x_f = x as f32;
-                        let world_pos = Vec3::new(x_f, wall_bottom + 1.0, wall_z);
-                        let clip_pos = view_proj * glam::Vec4::new(world_pos.x, world_pos.y, world_pos.z, 1.0);
-                        if clip_pos.w > 0.0 {
-                            let ndc = Vec3::new(clip_pos.x, clip_pos.y, clip_pos.z) / clip_pos.w;
-                            if ndc.x.abs() < 1.0 && ndc.y.abs() < 1.0 {
-                                let screen_x = (ndc.x * 0.5 + 0.5) * width as f32;
-                                let screen_y = (1.0 - (ndc.y * 0.5 + 0.5)) * height as f32;
-                                let label = format!("{}", x_f as i32);
-                                text_renderer.render_text(
-                                    &mut text_encoder,
-                                    &view,
-                                    &label,
-                                    screen_x,
-                                    screen_y,
-                                    20.0,
-                                    [1.0, 0.0, 0.0, 1.0],
-                                    width,
-                                    height,
-                                );
-                            }
-                        }
-                    }
-
-                    for y in (wall_bottom as i32..=wall_height as i32).step_by(major_step as usize) {
-                        let y_f = y as f32;
-                        let world_pos = Vec3::new(-wall_size + 1.0, y_f, wall_z);
-                        let clip_pos = view_proj * glam::Vec4::new(world_pos.x, world_pos.y, world_pos.z, 1.0);
-                        if clip_pos.w > 0.0 {
-                            let ndc = Vec3::new(clip_pos.x, clip_pos.y, clip_pos.z) / clip_pos.w;
-                            if ndc.x.abs() < 1.0 && ndc.y.abs() < 1.0 {
-                                let screen_x = (ndc.x * 0.5 + 0.5) * width as f32;
-                                let screen_y = (1.0 - (ndc.y * 0.5 + 0.5)) * height as f32;
-                                let label = format!("{}", y_f as i32);
-                                text_renderer.render_text(
-                                    &mut text_encoder,
-                                    &view,
-                                    &label,
-                                    screen_x,
-                                    screen_y,
-                                    20.0,
-                                    [1.0, 0.0, 0.0, 1.0],
-                                    width,
-                                    height,
-                                );
-                            }
-                        }
-                    }
 
                     let ground_y = self.world.map.ground_y;
                     let lower_frame = 0;

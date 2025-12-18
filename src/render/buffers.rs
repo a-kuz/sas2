@@ -165,7 +165,13 @@ pub fn find_texture<'a>(
         path.replace("../", ""),
     ];
     
-    if path.ends_with(".tga") {
+    if path.ends_with(".TGA") {
+        let png_path = path.replace(".TGA", ".png");
+        alt_paths.push(png_path.clone());
+        alt_paths.push(format!("../{}", png_path));
+        alt_paths.push(path.replace(".TGA", ".jpg"));
+        alt_paths.push(format!("../{}", path.replace(".TGA", ".jpg")));
+    } else if path.ends_with(".tga") {
         alt_paths.push(path.replace(".tga", ".png"));
         alt_paths.push(path.replace(".tga", ".jpg"));
         alt_paths.push(format!("../{}", path.replace(".tga", ".png")));
@@ -293,6 +299,10 @@ pub fn prepare_mesh_data(
                 render_shadow,
             );
 
+            let is_additive = texture_path.as_ref()
+                .map(|path| path.ends_with(".TGA"))
+                .unwrap_or(false);
+
             mesh_data.push(MeshRenderData {
                 vertex_buffer,
                 index_buffer,
@@ -301,6 +311,7 @@ pub fn prepare_mesh_data(
                 shadow_bind_group,
                 uniform_buffer: uniform_buffer.clone(),
                 shadow_uniform_buffer: shadow_uniform_buffer.clone(),
+                is_additive,
             });
         }
     }

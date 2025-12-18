@@ -5,7 +5,7 @@ use wgpu::util::DeviceExt;
 use glam::{Mat4, Vec3};
 use crate::engine::md3::MD3Model;
 use crate::engine::renderer::types::*;
-use crate::engine::shaders::{MD3_SHADER, GROUND_SHADER, SHADOW_SHADER, WALL_SHADOW_SHADER, WALL_SHADER, SHADOW_VOLUME_SHADER, SHADOW_APPLY_SHADER, SHADOW_PLANAR_SHADER};
+use crate::engine::shaders::{MD3_SHADER, MD3_ADDITIVE_SHADER, GROUND_SHADER, SHADOW_SHADER, WALL_SHADOW_SHADER, WALL_SHADER, SHADOW_VOLUME_SHADER, SHADOW_APPLY_SHADER, SHADOW_PLANAR_SHADER};
 
 use super::buffers::{BufferCacheKey, CachedBuffers};
 use super::layouts::*;
@@ -19,6 +19,7 @@ pub struct MD3Renderer {
     pub device: Arc<Device>,
     pub queue: Arc<Queue>,
     pub pipeline: Option<RenderPipeline>,
+    pub additive_pipeline: Option<RenderPipeline>,
     pub ground_pipeline: Option<RenderPipeline>,
     pub wall_pipeline: Option<RenderPipeline>,
     pub shadow_pipeline: Option<RenderPipeline>,
@@ -70,6 +71,7 @@ impl MD3Renderer {
             device,
             queue,
             pipeline: None,
+            additive_pipeline: None,
             ground_pipeline: None,
             wall_pipeline: None,
             shadow_pipeline: None,
@@ -203,6 +205,57 @@ impl MD3Renderer {
         });
 
         self.pipeline = Some(pipeline);
+
+        let additive_color_target = ColorTargetState {
+            format: surface_format,
+            blend: Some(BlendState {
+                color: BlendComponent {
+                    src_factor: BlendFactor::SrcAlpha,
+                    dst_factor: BlendFactor::One,
+                    operation: BlendOperation::Add,
+                },
+                alpha: BlendComponent {
+                    src_factor: BlendFactor::One,
+                    dst_factor: BlendFactor::One,
+                    operation: BlendOperation::Add,
+                },
+            }),
+            write_mask: ColorWrites::ALL,
+        };
+
+        let additive_shader = self.device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("MD3 Additive Shader"),
+            source: ShaderSource::Wgsl(MD3_ADDITIVE_SHADER.into()),
+        });
+
+        let additive_pipeline = self.device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("MD3 Additive Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &additive_shader,
+                entry_point: "vs_main",
+                buffers: &[VertexData::desc()],
+                compilation_options: PipelineCompilationOptions::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &additive_shader,
+                entry_point: "fs_main",
+                targets: &[Some(additive_color_target)],
+                compilation_options: PipelineCompilationOptions::default(),
+            }),
+            primitive: create_primitive_state(None),
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth24PlusStencil8,
+                depth_write_enabled: false,
+                depth_compare: CompareFunction::LessEqual,
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: create_multisample_state(),
+            multiview: None,
+        });
+
+        self.additive_pipeline = Some(additive_pipeline);
 
         let ground_shader = self.device.create_shader_module(ShaderModuleDescriptor {
             label: Some("Ground Shader"),
@@ -1063,6 +1116,7 @@ impl MD3Renderer {
         );
 
         let pipeline = self.pipeline.as_ref().unwrap();
+        let additive_pipeline = self.additive_pipeline.as_ref().unwrap();
         let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("MD3 Render Pass"),
             color_attachments: &[Some(RenderPassColorAttachment {
@@ -1084,10 +1138,13 @@ impl MD3Renderer {
             occlusion_query_set: None,
             timestamp_writes: None,
         });
-
-        render_pass.set_pipeline(pipeline);
         
         for mesh in &mesh_data {
+            if mesh.is_additive {
+                render_pass.set_pipeline(additive_pipeline);
+            } else {
+                render_pass.set_pipeline(pipeline);
+            }
             render_pass.set_bind_group(0, &mesh.bind_group, &[]);
             render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             render_pass.set_index_buffer(mesh.index_buffer.slice(..), IndexFormat::Uint16);

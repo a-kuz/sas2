@@ -5,7 +5,7 @@ use wgpu::util::DeviceExt;
 use glam::{Mat4, Vec3};
 use crate::engine::md3::MD3Model;
 use crate::render::types::*;
-use crate::engine::shaders::{MD3_SHADER, GROUND_SHADER, SHADOW_SHADER, WALL_SHADOW_SHADER, WALL_SHADER, SHADOW_VOLUME_SHADER, SHADOW_APPLY_SHADER, SHADOW_PLANAR_SHADER, COORDINATE_GRID_SHADER};
+use crate::engine::shaders::{MD3_SHADER, MD3_ADDITIVE_SHADER, GROUND_SHADER, SHADOW_SHADER, WALL_SHADOW_SHADER, WALL_SHADER, SHADOW_VOLUME_SHADER, SHADOW_APPLY_SHADER, SHADOW_PLANAR_SHADER, COORDINATE_GRID_SHADER, TILE_SHADER};
 
 use super::buffers::{BufferCacheKey, CachedBuffers};
 use super::layouts::*;
@@ -19,6 +19,7 @@ pub struct MD3Renderer {
     pub device: Arc<Device>,
     pub queue: Arc<Queue>,
     pub pipeline: Option<RenderPipeline>,
+    pub additive_pipeline: Option<RenderPipeline>,
     pub ground_pipeline: Option<RenderPipeline>,
     pub wall_pipeline: Option<RenderPipeline>,
     pub shadow_pipeline: Option<RenderPipeline>,
@@ -27,6 +28,7 @@ pub struct MD3Renderer {
     pub bind_group_layout: BindGroupLayout,
     pub ground_bind_group_layout: BindGroupLayout,
     pub wall_bind_group_layout: BindGroupLayout,
+    pub tile_bind_group_layout: BindGroupLayout,
     particle_bind_group_layout: BindGroupLayout,
     pub model_textures: HashMap<String, WgpuTexture>,
     pub ground_vertex_buffer: Option<Buffer>,
@@ -36,6 +38,13 @@ pub struct MD3Renderer {
     pub wall_index_buffer: Option<Buffer>,
     pub wall_texture: Option<WgpuTexture>,
     pub wall_curb_texture: Option<WgpuTexture>,
+    pub tile_vertex_buffer: Option<Buffer>,
+    pub tile_index_buffer: Option<Buffer>,
+    pub tile_num_indices: u32,
+    pub tile_texture: Option<WgpuTexture>,
+    tile_uniform_buffer: Option<Buffer>,
+    tile_bind_group: Option<BindGroup>,
+    pub tile_pipeline: Option<RenderPipeline>,
     buffer_cache: HashMap<BufferCacheKey, CachedBuffers>,
     ground_uniform_buffer: Option<Buffer>,
     wall_uniform_buffer: Option<Buffer>,
@@ -61,6 +70,7 @@ impl MD3Renderer {
         let bind_group_layout = create_md3_bind_group_layout(&device);
         let ground_bind_group_layout = create_ground_bind_group_layout(&device);
         let wall_bind_group_layout = create_wall_bind_group_layout(&device);
+        let tile_bind_group_layout = create_tile_bind_group_layout(&device);
         let particle_bind_group_layout = create_particle_bind_group_layout(&device);
         let debug_light_sphere_bind_group_layout = create_debug_light_sphere_bind_group_layout(&device);
         let debug_light_ray_bind_group_layout = create_debug_light_ray_bind_group_layout(&device);
@@ -92,6 +102,7 @@ impl MD3Renderer {
             device,
             queue,
             pipeline: None,
+            additive_pipeline: None,
             ground_pipeline: None,
             wall_pipeline: None,
             shadow_pipeline: None,
@@ -100,6 +111,7 @@ impl MD3Renderer {
             bind_group_layout,
             ground_bind_group_layout,
             wall_bind_group_layout,
+            tile_bind_group_layout,
             particle_bind_group_layout,
             model_textures: HashMap::new(),
             ground_vertex_buffer: None,
@@ -109,6 +121,13 @@ impl MD3Renderer {
             wall_index_buffer: None,
             wall_texture: None,
             wall_curb_texture: None,
+            tile_vertex_buffer: None,
+            tile_index_buffer: None,
+            tile_num_indices: 0,
+            tile_texture: None,
+            tile_uniform_buffer: None,
+            tile_bind_group: None,
+            tile_pipeline: None,
             buffer_cache: HashMap::new(),
             ground_uniform_buffer: None,
             wall_uniform_buffer: None,
@@ -231,6 +250,57 @@ impl MD3Renderer {
         });
 
         self.pipeline = Some(pipeline);
+
+        let additive_color_target = ColorTargetState {
+            format: surface_format,
+            blend: Some(BlendState {
+                color: BlendComponent {
+                    src_factor: BlendFactor::SrcAlpha,
+                    dst_factor: BlendFactor::One,
+                    operation: BlendOperation::Add,
+                },
+                alpha: BlendComponent {
+                    src_factor: BlendFactor::One,
+                    dst_factor: BlendFactor::One,
+                    operation: BlendOperation::Add,
+                },
+            }),
+            write_mask: ColorWrites::ALL,
+        };
+
+        let additive_shader = self.device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("MD3 Additive Shader"),
+            source: ShaderSource::Wgsl(MD3_ADDITIVE_SHADER.into()),
+        });
+
+        let additive_pipeline = self.device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("MD3 Additive Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &additive_shader,
+                entry_point: "vs_main",
+                buffers: &[VertexData::desc()],
+                compilation_options: PipelineCompilationOptions::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &additive_shader,
+                entry_point: "fs_main",
+                targets: &[Some(additive_color_target)],
+                compilation_options: PipelineCompilationOptions::default(),
+            }),
+            primitive: create_primitive_state(None),
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth24PlusStencil8,
+                depth_write_enabled: false,
+                depth_compare: CompareFunction::LessEqual,
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: create_multisample_state(),
+            multiview: None,
+        });
+
+        self.additive_pipeline = Some(additive_pipeline);
 
         let ground_shader = self.device.create_shader_module(ShaderModuleDescriptor {
             label: Some("Ground Shader"),
@@ -432,6 +502,40 @@ impl MD3Renderer {
         });
 
         self.wall_shadow_pipeline = Some(wall_shadow_pipeline);
+
+        let tile_shader = self.device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Tile Shader"),
+            source: ShaderSource::Wgsl(TILE_SHADER.into()),
+        });
+
+        let tile_pipeline_layout = self.device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Tile Pipeline Layout"),
+            bind_group_layouts: &[&self.tile_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let tile_pipeline = self.device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Tile Pipeline"),
+            layout: Some(&tile_pipeline_layout),
+            vertex: VertexState {
+                module: &tile_shader,
+                entry_point: "vs_main",
+                buffers: &[VertexData::desc()],
+                compilation_options: PipelineCompilationOptions::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &tile_shader,
+                entry_point: "fs_main",
+                targets: &[Some(create_color_target_state(surface_format))],
+                compilation_options: PipelineCompilationOptions::default(),
+            }),
+            primitive: create_primitive_state(None),
+            depth_stencil: Some(create_depth_stencil_state(true)),
+            multisample: create_multisample_state(),
+            multiview: None,
+        });
+
+        self.tile_pipeline = Some(tile_pipeline);
 
         let ground_size = 500.0;
         let ground_y = 0.0;
@@ -1091,6 +1195,7 @@ impl MD3Renderer {
         );
 
         let pipeline = self.pipeline.as_ref().unwrap();
+        let additive_pipeline = self.additive_pipeline.as_ref().unwrap();
         let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("MD3 Render Pass"),
             color_attachments: &[Some(RenderPassColorAttachment {
@@ -1112,10 +1217,13 @@ impl MD3Renderer {
             occlusion_query_set: None,
             timestamp_writes: None,
         });
-
-        render_pass.set_pipeline(pipeline);
         
         for mesh in &mesh_data {
+            if mesh.is_additive {
+                render_pass.set_pipeline(additive_pipeline);
+            } else {
+                render_pass.set_pipeline(pipeline);
+            }
             render_pass.set_bind_group(0, &mesh.bind_group, &[]);
             render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             render_pass.set_index_buffer(mesh.index_buffer.slice(..), IndexFormat::Uint16);
@@ -1604,6 +1712,122 @@ impl MD3Renderer {
             let num_indices = index_buffer.size() as u32 / std::mem::size_of::<u16>() as u32;
             render_pass.draw_indexed(0..num_indices, 0, 0..1);
         }
+    }
+
+    pub fn load_map_tiles(&mut self, map: &crate::game::map::Map) {
+        use crate::render::map_meshes::TileMeshes;
+        use crate::render::textures_tile::create_tile_texture;
+
+        let tile_meshes = TileMeshes::generate_from_map(map);
+
+        if tile_meshes.vertices.is_empty() {
+            return;
+        }
+
+        let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Tile Vertex Buffer"),
+            contents: bytemuck::cast_slice(&tile_meshes.vertices),
+            usage: BufferUsages::VERTEX,
+        });
+
+        let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Tile Index Buffer"),
+            contents: bytemuck::cast_slice(&tile_meshes.indices),
+            usage: BufferUsages::INDEX,
+        });
+
+        self.tile_vertex_buffer = Some(vertex_buffer);
+        self.tile_index_buffer = Some(index_buffer);
+        self.tile_num_indices = tile_meshes.indices.len() as u32;
+
+        if self.tile_texture.is_none() {
+            self.tile_texture = Some(create_tile_texture(&self.device, &self.queue));
+        }
+
+        println!("Loaded map tiles: {} vertices, {} indices", tile_meshes.vertices.len(), tile_meshes.indices.len());
+    }
+
+    pub fn render_tiles(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        output_view: &TextureView,
+        depth_view: &TextureView,
+        view_proj: Mat4,
+        camera_pos: Vec3,
+        lights: &[(Vec3, Vec3, f32)],
+        ambient_light: f32,
+        surface_format: TextureFormat,
+    ) {
+        if self.tile_pipeline.is_none() {
+            self.create_pipeline(surface_format);
+        }
+
+        if self.tile_vertex_buffer.is_none() || self.tile_index_buffer.is_none() {
+            return;
+        }
+
+        let uniforms = self.create_uniforms(
+            view_proj,
+            Mat4::IDENTITY,
+            camera_pos,
+            lights,
+            ambient_light,
+        );
+
+        let uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Tile Uniform Buffer"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: BufferUsages::UNIFORM,
+        });
+
+        let tile_texture = self.tile_texture.as_ref().unwrap();
+        let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Tile Bind Group"),
+            layout: &self.tile_bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(&tile_texture.view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Sampler(&tile_texture.sampler),
+                },
+            ],
+        });
+
+        let pipeline = self.tile_pipeline.as_ref().unwrap();
+        let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("Tile Render Pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: output_view,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(Operations {
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+
+        render_pass.set_pipeline(pipeline);
+        render_pass.set_bind_group(0, &bind_group, &[]);
+        render_pass.set_vertex_buffer(0, self.tile_vertex_buffer.as_ref().unwrap().slice(..));
+        render_pass.set_index_buffer(self.tile_index_buffer.as_ref().unwrap().slice(..), IndexFormat::Uint16);
+        render_pass.draw_indexed(0..self.tile_num_indices, 0, 0..1);
     }
 }
 

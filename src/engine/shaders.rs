@@ -1,3 +1,63 @@
+pub const MD3_ADDITIVE_SHADER: &str = r#"
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) normal: vec3<f32>,
+}
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+}
+
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+    model: mat4x4<f32>,
+    camera_pos: vec4<f32>,
+    lights: array<LightData, 8>,
+    num_lights: i32,
+    ambient_light: f32,
+    _padding0: f32,
+    _padding1: f32,
+}
+
+struct LightData {
+    position: vec4<f32>,
+    color: vec4<f32>,
+    radius: f32,
+    _padding0: f32,
+    _padding1: f32,
+    _padding2: f32,
+}
+
+@group(0) @binding(0)
+var<uniform> uniforms: Uniforms;
+
+@group(0) @binding(1)
+var model_texture: texture_2d<f32>;
+
+@group(0) @binding(2)
+var model_sampler: sampler;
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    let world_pos = uniforms.model * vec4<f32>(input.position, 1.0);
+    output.clip_position = uniforms.view_proj * world_pos;
+    output.uv = input.uv;
+    output.color = input.color;
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let tex_color = textureSample(model_texture, model_sampler, input.uv);
+    return vec4<f32>(tex_color.rgb * input.color.rgb, tex_color.a * input.color.a);
+}
+"#;
+
 pub const MD3_SHADER: &str = r#"
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -174,11 +234,11 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let texture_size = 64.0;
-    let scale = 25.0;
+    let scale = 1.0;
     
     let tiled_uv = vec2<f32>(
         input.world_pos.x / texture_size * scale,
-        input.world_pos.z / texture_size * scale
+        input.world_pos.y / texture_size * scale
     );
     
     let tex_color = textureSample(ground_texture, ground_sampler, tiled_uv).rgb;
@@ -491,7 +551,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let wall_bottom = 0.0;
     let wall_height = 50.0;
-    let curb_height = 0.8;
+    let curb_height = 10.0;
     let curb_start = wall_bottom;
     let curb_end = wall_bottom + curb_height;
     
@@ -499,7 +559,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let is_curb = world_y >= curb_start && world_y <= curb_end;
     
     let texture_size = 64.0;
-    let scale = 25.0;
+    let scale = 1.0;
     
     let tiled_uv = vec2<f32>(
         input.world_pos.x / texture_size * scale,
@@ -567,6 +627,113 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     
     return vec4<f32>(base_color * lighting, 1.0);
+}
+"#;
+
+pub const TILE_SHADER: &str = r#"
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) normal: vec3<f32>,
+}
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) world_pos: vec3<f32>,
+    @location(2) normal: vec3<f32>,
+}
+
+struct LightData {
+    position: vec4<f32>,
+    color: vec4<f32>,
+    radius: f32,
+    _padding0: f32,
+    _padding1: f32,
+    _padding2: f32,
+}
+
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+    model: mat4x4<f32>,
+    camera_pos: vec4<f32>,
+    lights: array<LightData, 8>,
+    num_lights: i32,
+    ambient_light: f32,
+    _padding0: f32,
+    _padding1: f32,
+}
+
+@group(0) @binding(0)
+var<uniform> uniforms: Uniforms;
+
+@group(0) @binding(1)
+var tile_texture: texture_2d<f32>;
+
+@group(0) @binding(2)
+var tile_sampler: sampler;
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    let world_pos = uniforms.model * vec4<f32>(input.position, 1.0);
+    output.clip_position = uniforms.view_proj * world_pos;
+    output.uv = input.uv;
+    output.world_pos = world_pos.xyz;
+    output.normal = normalize((uniforms.model * vec4<f32>(input.normal, 0.0)).xyz);
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let texture_size = 64.0;
+    let scale = 1.0;
+    
+    let tiled_uv = vec2<f32>(
+        input.world_pos.x / texture_size * scale,
+        input.world_pos.z / texture_size * scale
+    );
+    
+    let tex_color = textureSample(tile_texture, tile_sampler, tiled_uv).rgb;
+    
+    var lighting = vec3<f32>(uniforms.ambient_light);
+    
+    for (var i = 0; i < uniforms.num_lights; i++) {
+        let light = uniforms.lights[i];
+        let light_vec = light.position.xyz - input.world_pos;
+        let dist_sq = dot(light_vec, light_vec);
+        let radius_sq = light.radius * light.radius;
+        
+        if (dist_sq > radius_sq) {
+            continue;
+        }
+        
+        let dist_norm_sq = dist_sq / radius_sq;
+        if (dist_norm_sq >= 1.0) {
+            continue;
+        }
+        
+        let light_dir = light_vec * inverseSqrt(max(dist_sq, 0.0001));
+        let ndotl = max(dot(input.normal, light_dir), 0.0);
+        
+        if (ndotl < 0.01) {
+            continue;
+        }
+        
+        let falloff = 1.0 - dist_norm_sq;
+        let attenuation = falloff * falloff * falloff;
+        
+        let contribution = light.color.xyz * ndotl * attenuation;
+        
+        if (max(max(contribution.x, contribution.y), contribution.z) < 0.001) {
+            continue;
+        }
+        
+        lighting += contribution;
+    }
+    
+    return vec4<f32>(tex_color * lighting, 1.0);
 }
 "#;
 

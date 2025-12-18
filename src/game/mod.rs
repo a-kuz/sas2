@@ -16,6 +16,7 @@ pub mod particle;
 pub mod weapon;
 pub mod player;
 pub mod map;
+pub mod map_loader;
 pub mod world;
 
 pub use core::player::PlayerState;

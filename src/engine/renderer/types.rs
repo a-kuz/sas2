@@ -79,4 +79,5 @@ pub struct MeshRenderData {
     pub shadow_bind_group: Option<BindGroup>,
     pub uniform_buffer: Arc<Buffer>,
     pub shadow_uniform_buffer: Option<Arc<Buffer>>,
+    pub is_additive: bool,
 }

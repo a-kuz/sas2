@@ -7,10 +7,12 @@ pub mod crosshair;
 pub mod shadows;
 pub mod pipelines;
 pub mod textures;
+pub mod textures_tile;
 pub mod buffers;
 pub mod layouts;
 pub mod debug;
 pub mod particles;
+pub mod map_meshes;
 
 pub use wgpu_renderer::WgpuRenderer;
 pub use md3_renderer::MD3Renderer;
