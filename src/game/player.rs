@@ -1,4 +1,6 @@
 use super::constants::*;
+use super::map::Map;
+use super::physics::pmove::{self, PmoveCmd, PmoveState};
 use super::weapon::Weapon;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,6 +45,7 @@ pub struct Player {
     pub prev_y: f32,
     pub facing_right: bool,
     pub is_moving: bool,
+    pub is_moving_backward: bool,
     pub animation_time: f32,
     pub state: PlayerState,
     pub is_crouching: bool,
@@ -102,6 +105,7 @@ impl Player {
             prev_y: 0.0,
             facing_right: true,
             is_moving: false,
+            is_moving_backward: false,
             animation_time: 0.0,
             state: PlayerState::Ground,
             is_crouching: false,
@@ -256,7 +260,7 @@ impl Player {
         }
     }
 
-    pub fn update(&mut self, dt: f32, move_left: bool, move_right: bool, jump: bool, crouch: bool, ground_y: f32, aim_angle: f32) -> Vec<crate::audio::events::AudioEvent> {
+    pub fn update(&mut self, dt: f32, move_left: bool, move_right: bool, jump: bool, crouch: bool, map: &mut Map, aim_angle: f32) -> Vec<crate::audio::events::AudioEvent> {
         let mut audio_events = Vec::new();
         let was_moving = self.is_moving;
         let was_state = self.state;
@@ -311,93 +315,115 @@ impl Player {
             self.model_yaw += 2.0 * std::f32::consts::PI;
         }
 
-        let speed_mult = if self.powerups.haste > 0 { HASTE_SPEED_MULT } else { 1.0 };
-        let jump_mult = if self.powerups.haste > 0 { HASTE_JUMP_MULT } else { 1.0 };
+        let move_axis = match (move_left, move_right) {
+            (true, false) => -1.0,
+            (false, true) => 1.0,
+            _ => 0.0,
+        };
 
-        let gravity = GRAVITY;
-        let jump_velocity = JUMP_VELOCITY * jump_mult;
-        let ground_accel = GROUND_ACCEL * speed_mult;
-        let air_accel = AIR_ACCEL * speed_mult;
-        let ground_friction = FRICTION;
-        let air_friction = AIR_FRICTION;
-        let max_speed = MAX_SPEED * speed_mult;
-        let crouch_speed_mult = CROUCH_SPEED_MULT;
+        let state = PmoveState {
+            x: self.x,
+            y: self.y,
+            vel_x: self.vx,
+            vel_y: self.vy,
+            was_in_air: self.was_in_air,
+        };
+        let cmd = PmoveCmd {
+            move_right: move_axis,
+            jump,
+            crouch,
+            haste_active: self.powerups.haste > 0,
+        };
+
+        let result = pmove::pmove(&state, &cmd, dt, map);
+
+        self.x = result.new_x;
+        self.y = result.new_y;
+        self.vx = result.new_vel_x;
+        self.vy = result.new_vel_y;
+
+        use crate::game::constants::PLAYER_HITBOX_WIDTH;
+        let half_w = PLAYER_HITBOX_WIDTH * 0.5;
+        let player_left = self.x - half_w;
+        let player_right = self.x + half_w;
+        let player_bottom = self.y;
+        let player_top = self.y + crate::game::constants::PLAYER_HITBOX_HEIGHT;
         
-        let on_ground = self.y <= ground_y && self.vy <= 0.0;
-        
-        if on_ground {
-            self.y = ground_y;
-            self.vy = 0.0;
+        for (i, teleporter) in map.teleporters.iter().enumerate() {
+            let tp_left = teleporter.x;
+            let tp_right = teleporter.x + teleporter.width;
+            let tp_bottom = teleporter.y;
+            let tp_top = teleporter.y + teleporter.height;
             
-            if self.was_in_air {
-                self.landing_time = 0.0;
-                audio_events.push(crate::audio::events::AudioEvent::PlayerLand { x: self.x });
+            let in_x = player_right >= tp_left && player_left <= tp_right;
+            let in_y = player_top >= tp_bottom && player_bottom <= tp_top;
+            
+            let center_x = teleporter.x + teleporter.width * 0.5;
+            let center_y = teleporter.y + teleporter.height * 0.5;
+            let dist = ((self.x - center_x).powi(2) + ((self.y + 35.0) - center_y).powi(2)).sqrt();
+            let near = dist < 100.0;
+            
+            if near || in_x || in_y {
+                println!("Teleporter[{}]: pos=({:.2},{:.2}) size=({:.2},{:.2}), dest=({:.2},{:.2}), player=({:.2},{:.2}) hitbox=({:.2}-{:.2}, {:.2}-{:.2}), dist={:.2}, in_x={}, in_y={}", 
+                    i, teleporter.x, teleporter.y, teleporter.width, teleporter.height, 
+                    teleporter.dest_x, teleporter.dest_y, self.x, self.y, player_left, player_right, player_bottom, player_top, dist, in_x, in_y);
             }
-            self.was_in_air = false;
             
+            if in_x && in_y {
+                println!("Teleporter[{}] ACTIVATED: ({:.2},{:.2}) -> ({:.2},{:.2})", 
+                    i, self.x, self.y, teleporter.dest_x, teleporter.dest_y);
+                self.x = teleporter.dest_x;
+                self.y = teleporter.dest_y;
+                break;
+            }
+        }
+
+        self.was_in_air = result.new_was_in_air;
+        self.is_crouching = crouch;
+
+        let on_ground = !self.was_in_air;
+        self.state = if on_ground {
             if crouch {
-                self.state = PlayerState::Crouching;
-                self.is_crouching = true;
-                self.crouch_time += dt;
+                PlayerState::Crouching
             } else {
-                self.is_crouching = false;
-                self.crouch_time = 0.0;
-                
-                if jump {
-                    self.vy = jump_velocity;
-                    self.state = PlayerState::Air;
-                    self.jump_time = 0.0;
-                    self.was_in_air = true;
-                    audio_events.push(crate::audio::events::AudioEvent::PlayerJump { 
-                        x: self.x, 
-                        model: self.model.clone() 
-                    });
-                } else {
-                    self.state = PlayerState::Ground;
-                }
+                PlayerState::Ground
             }
         } else {
-            self.state = PlayerState::Air;
-            self.is_crouching = false;
-            self.crouch_time = 0.0;
-            self.jump_time += dt;
-            self.was_in_air = true;
-        }
-        
-        self.landing_time += dt;
-        
-        let accel = if on_ground { ground_accel } else { air_accel };
-        let friction = if on_ground { ground_friction } else { air_friction };
-        let speed_mult_final = if self.is_crouching { crouch_speed_mult } else { 1.0 };
-        
-        if move_left && !move_right {
-            self.vx -= accel * dt;
-            self.is_moving = true;
-        } else if move_right && !move_left {
-            self.vx += accel * dt;
-            self.is_moving = true;
+            PlayerState::Air
+        };
+
+        if crouch {
+            self.crouch_time += dt;
         } else {
-            self.is_moving = false;
+            self.crouch_time = 0.0;
         }
-        
-        self.vx -= self.vx * friction * dt;
-        self.vx = self.vx.clamp(-max_speed * speed_mult_final, max_speed * speed_mult_final);
-        
-        if self.vx.abs() < 0.01 {
-            self.vx = 0.0;
+
+        if on_ground {
+            self.jump_time = 0.0;
+        } else {
+            self.jump_time += dt;
         }
-        
-        if !on_ground {
-            self.vy -= gravity * dt;
+
+        if result.jumped {
+            self.jump_time = 0.0;
+            audio_events.push(crate::audio::events::AudioEvent::PlayerJump {
+                x: self.x,
+                model: self.model.clone(),
+            });
         }
-        
-        self.x += self.vx * dt;
-        self.y += self.vy * dt;
-        
-        if self.y < ground_y {
-            self.y = ground_y;
-            self.vy = 0.0;
+
+        if result.landed {
+            self.landing_time = 0.0;
+            audio_events.push(crate::audio::events::AudioEvent::PlayerLand { x: self.x });
         }
+
+        self.landing_time += dt;
+
+        self.is_moving = self.vx.abs() > 0.1 || (!on_ground && self.vy.abs() > 0.5);
+        self.is_moving_backward = on_ground && (
+            (self.facing_right && self.vx < -0.1) || 
+            (!self.facing_right && self.vx > 0.1)
+        );
         
         if self.is_moving != was_moving || self.state != was_state {
             self.animation_time = 0.0;

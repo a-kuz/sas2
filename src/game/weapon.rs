@@ -102,7 +102,7 @@ impl Weapon {
     pub fn is_hitscan(&self) -> bool {
         matches!(
             self,
-            Weapon::MachineGun | Weapon::Shotgun | Weapon::Lightning | Weapon::Railgun
+            Weapon::MachineGun | Weapon::Shotgun | Weapon::Lightning | Weapon::Railgun | Weapon::Gauntlet
         )
     }
 }

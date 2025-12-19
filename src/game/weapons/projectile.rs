@@ -1,6 +1,7 @@
 use glam::Vec3;
 use crate::engine::math::Frustum;
 use crate::game::constants::*;
+use crate::game::map::Map;
 
 pub struct Rocket {
     pub position: Vec3,
@@ -78,21 +79,47 @@ impl Grenade {
         }
     }
 
-    pub fn update(&mut self, dt: f32, ground_y: f32) {
+    pub fn update(&mut self, dt: f32, map: &Map) {
         if !self.active {
             return;
         }
 
-        self.position += self.velocity * dt;
-        self.velocity.y -= GRAVITY * dt;
-        self.lifetime += dt;
+        let dt_60fps = dt * 60.0;
+        self.velocity.y += 0.25 * dt_60fps;
 
-        if self.position.y <= ground_y {
-            self.position.y = ground_y;
+        let old_x = self.position.x;
+        let old_y = self.position.y;
+
+        self.position.x += self.velocity.x * dt_60fps;
+
+        let tile_x = map.world_to_tile_x(self.position.x);
+        let tile_y = map.world_to_tile_y(self.position.y);
+
+        if map.is_solid(tile_x, tile_y) && self.velocity.x.abs() > 0.1 {
+            self.position.x = old_x;
+            self.velocity.x = -self.velocity.x * GRENADE_BOUNCE_WALL;
+            self.velocity.x /= GRENADE_SLOWDOWN;
+            self.bounced = true;
+        }
+
+        self.position.y += self.velocity.y * dt_60fps;
+
+        let tile_x = map.world_to_tile_x(self.position.x);
+        let tile_y = map.world_to_tile_y(self.position.y);
+
+        if map.is_solid(tile_x, tile_y) && self.velocity.y.abs() > 0.1 {
+            self.position.y = old_y;
             self.velocity.y = -self.velocity.y * GRENADE_BOUNCE_FLOOR;
             self.velocity.x /= GRENADE_SLOWDOWN;
             self.bounced = true;
         }
+
+        if self.velocity.x.abs() < 0.1 && self.velocity.y.abs() < 0.1 {
+            self.velocity.x = 0.0;
+            self.velocity.y = 0.0;
+        }
+
+        self.lifetime += dt;
 
         if self.lifetime >= self.fuse_time {
             self.active = false;

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::time::Instant;
+use std::collections::{HashMap, HashSet};
 
 use glam::{Mat3, Mat4, Vec3};
 use pollster::FutureExt;
@@ -13,7 +14,12 @@ use winit::{
 };
 
 use sas2::engine::anim::{AnimConfig, AnimRange};
-use sas2::engine::loader::{load_textures_for_model_static, load_weapon_textures_static, load_rocket_textures_static};
+use sas2::engine::loader::{
+    load_textures_for_model_static,
+    load_weapon_textures_static,
+    load_rocket_textures_static,
+    load_md3_textures_guess_static,
+};
 use sas2::engine::math::{axis_from_mat3, attach_rotated_entity, orientation_to_mat4, Orientation, Frustum};
 use sas2::engine::md3::MD3Model;
 use sas2::engine::renderer::{MD3Renderer, WgpuRenderer};
@@ -23,7 +29,7 @@ use sas2::game::world::World;
 use sas2::game::camera::Camera;
 use sas2::game::lighting::{LightingParams, Light};
 // use sas2::game::player::Player;
-use sas2::game::Rocket;
+use sas2::game::map::ItemType;
 
 struct PlayerModel {
     lower: Option<MD3Model>,
@@ -53,6 +59,12 @@ impl PlayerModel {
     }
 }
 
+struct StaticModel {
+    model: MD3Model,
+    textures: Vec<Option<String>>,
+    scale: f32,
+}
+
 struct GameApp {
     window: Option<Arc<Window>>,
     wgpu_renderer: Option<WgpuRenderer>,
@@ -63,6 +75,9 @@ struct GameApp {
     player2_model: PlayerModel,
     rocket_model: Option<MD3Model>,
     rocket_textures: Vec<Option<String>>,
+    item_models: HashMap<ItemType, StaticModel>,
+    teleporter_marker: Option<StaticModel>,
+    jumppad_marker: Option<StaticModel>,
     depth_texture: Option<Texture>,
     depth_view: Option<wgpu::TextureView>,
     start_time: Instant,
@@ -70,6 +85,7 @@ struct GameApp {
     last_fps_update: Instant,
     frame_count: u32,
     fps: f32,
+    last_debug_log: Instant,
     
     world: World,
     local_player_id: u32,
@@ -79,7 +95,6 @@ struct GameApp {
     jump_pressed: bool,
     crouch_pressed: bool,
     shoot_pressed: bool,
-    last_shot_time: f32,
     is_shooting: bool,
     shoot_anim_start_time: f32,
     
@@ -88,12 +103,12 @@ struct GameApp {
     player2_next_gesture_time: f32,
     
     camera: Camera,
-    camera_move_x_neg: bool,
-    camera_move_x_pos: bool,
-    camera_move_y_neg: bool,
-    camera_move_y_pos: bool,
     camera_move_z_neg: bool,
     camera_move_z_pos: bool,
+    camera_pitch_up: bool,
+    camera_pitch_down: bool,
+    camera_yaw_left: bool,
+    camera_yaw_right: bool,
 
     aim_x: f32,
     aim_y: f32,
@@ -108,6 +123,59 @@ struct GameApp {
 }
 
 impl GameApp {
+    fn item_model_path(item_type: ItemType) -> &'static str {
+        match item_type {
+            ItemType::Health25 => "q3-resources/models/powerups/health/medium_cross.md3",
+            ItemType::Health50 => "q3-resources/models/powerups/health/large_cross.md3",
+            ItemType::Health100 => "q3-resources/models/powerups/health/mega_cross.md3",
+            ItemType::Armor50 => "q3-resources/models/powerups/armor/armor_yel.md3",
+            ItemType::Armor100 => "q3-resources/models/powerups/armor/armor_red.md3",
+            ItemType::Shotgun => "q3-resources/models/weapons2/shotgun/shotgun.md3",
+            ItemType::GrenadeLauncher => "q3-resources/models/weapons2/grenadel/grenadel.md3",
+            ItemType::RocketLauncher => "q3-resources/models/weapons2/rocketl/rocketl.md3",
+            ItemType::LightningGun => "q3-resources/models/weapons2/lightning/lightning.md3",
+            ItemType::Railgun => "q3-resources/models/weapons2/railgun/railgun.md3",
+            ItemType::Plasmagun => "q3-resources/models/weapons2/plasma/plasma.md3",
+            ItemType::BFG => "q3-resources/models/weapons2/bfg/bfg.md3",
+            ItemType::Quad => "q3-resources/models/powerups/instant/quad.md3",
+            ItemType::Regen => "q3-resources/models/powerups/instant/regen.md3",
+            ItemType::Battle => "q3-resources/models/powerups/instant/enviro.md3",
+            ItemType::Flight => "q3-resources/models/powerups/instant/flight.md3",
+            ItemType::Haste => "q3-resources/models/powerups/instant/haste.md3",
+            ItemType::Invis => "q3-resources/models/powerups/instant/invis.md3",
+        }
+    }
+
+    fn item_model_scale(item_type: ItemType) -> f32 {
+        match item_type {
+            ItemType::Shotgun
+            | ItemType::GrenadeLauncher
+            | ItemType::RocketLauncher
+            | ItemType::LightningGun
+            | ItemType::Railgun
+            | ItemType::Plasmagun
+            | ItemType::BFG => 1.35,
+            _ => 1.0,
+        }
+    }
+
+    fn load_static_model(
+        wgpu_renderer: &mut WgpuRenderer,
+        md3_renderer: &mut MD3Renderer,
+        model_path: &str,
+        scale: f32,
+    ) -> Option<StaticModel> {
+        let model = MD3Model::load(model_path).ok();
+        if model.is_none() {
+            println!("Failed to load static model: {}", model_path);
+            return None;
+        }
+        let model = model.unwrap();
+        let textures = load_md3_textures_guess_static(wgpu_renderer, md3_renderer, &model, model_path);
+        println!("Loaded static model: {} with {} textures", model_path, textures.len());
+        Some(StaticModel { model, textures, scale })
+    }
+
     fn new() -> Self {
         let now = Instant::now();
         let mut world = World::new();
@@ -131,6 +199,9 @@ impl GameApp {
             player2_model: PlayerModel::new(),
             rocket_model: None,
             rocket_textures: Vec::new(),
+            item_models: HashMap::new(),
+            teleporter_marker: None,
+            jumppad_marker: None,
             depth_texture: None,
             depth_view: None,
             start_time: now,
@@ -138,6 +209,7 @@ impl GameApp {
             last_fps_update: now,
             frame_count: 0,
             fps: 0.0,
+            last_debug_log: now,
             
             world,
             local_player_id,
@@ -147,7 +219,6 @@ impl GameApp {
             jump_pressed: false,
             crouch_pressed: false,
             shoot_pressed: false,
-            last_shot_time: 0.0,
             is_shooting: false,
             shoot_anim_start_time: 0.0,
             
@@ -156,12 +227,12 @@ impl GameApp {
             player2_next_gesture_time: 5.0,
             
             camera: Camera::new(),
-            camera_move_x_neg: false,
-            camera_move_x_pos: false,
-            camera_move_y_neg: false,
-            camera_move_y_pos: false,
             camera_move_z_neg: false,
             camera_move_z_pos: false,
+            camera_pitch_up: false,
+            camera_pitch_down: false,
+            camera_yaw_left: false,
+            camera_yaw_right: false,
             
             aim_x: 1.0,
             aim_y: 0.0,
@@ -257,6 +328,7 @@ impl GameApp {
     fn calculate_legs_frame(
         anim_config: &Option<AnimConfig>,
         is_moving: bool,
+        is_moving_backward: bool,
         animation_time: f32,
         model: &MD3Model,
         state: sas2::game::player::PlayerState,
@@ -275,7 +347,9 @@ impl GameApp {
                     }
                 }
                 PlayerState::Ground => {
-                    if is_moving {
+                    if is_moving_backward {
+                        &config.legs_back
+                    } else if is_moving {
                         &config.legs_run
                     } else {
                         &config.legs_idle
@@ -326,130 +400,6 @@ impl GameApp {
         } else {
             0
         }
-    }
-
-    fn compute_weapon_world_position(
-        weapon_orientation: Option<&Orientation>,
-        player_x: f32,
-        player_y: f32,
-        model_yaw: f32,
-        ground_y: f32,
-    ) -> Vec3 {
-        if let Some(weapon_orient) = weapon_orientation {
-            let scale = 1.0;
-            let md3_correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
-            let facing_rotation = Mat3::from_rotation_y(model_yaw);
-            let combined_rotation = facing_rotation * md3_correction;
-            
-            let model_bottom_offset = 0.9;
-            let render_y = ground_y + model_bottom_offset + player_y;
-            let game_translation = Mat4::from_translation(Vec3::new(player_x, render_y, 50.0));
-            let game_rotation = Mat4::from_mat3(combined_rotation);
-            let game_transform = game_translation * game_rotation;
-            let scale_mat = Mat4::from_scale(Vec3::splat(scale));
-            
-            let weapon_local_pos = weapon_orient.origin;
-            let weapon_scaled = scale_mat.transform_point3(weapon_local_pos);
-            let weapon_world = game_transform.transform_point3(weapon_scaled);
-            
-            weapon_world
-        } else {
-            let model_bottom_offset = 0.9;
-            let render_y = ground_y + model_bottom_offset + player_y;
-            Vec3::new(player_x, render_y + 0.5, 50.0)
-        }
-    }
-
-    fn shoot_rocket(&mut self, view_proj: Mat4, weapon_orientation: Option<Orientation>, aim_angle: f32) {
-        let player = match self.world.players.get(self.local_player_id as usize) {
-            Some(p) => p,
-            None => return,
-        };
-
-        let rocket_position = if let Some(weapon_orient) = weapon_orientation {
-            let scale = 1.0;
-            // Use aim_angle for rotation instead of just facing_right
-            // But weapon orientation already includes some rotation from torso/weapon_bone?
-            // render_player calculates orientation based on aim_angle.
-            // So weapon_orient should be correct in world space?
-            // BUT render_player applies transformations to MD3 model matrix.
-            // weapon_orient returned by render_player IS in local space relative to upper body?
-            // No, render_player returns local orientation attached to upper?
-            // "weapon_orientation_result = Some(attach_rotated_entity(&upper_orientation, weapon_tag));"
-            // upper_orientation is attached to lower_orientation.
-            // lower_orientation is attached to world (but computed in render_player).
-            
-            // Wait, render_player logic:
-            // lower_orientation passed in.
-            // upper_orientation attached to lower.
-            // weapon_orientation attached to upper.
-            // So weapon_orientation is relative to lower_orientation's base.
-            
-            // In shoot_rocket implementation:
-            // "let facing_angle = if player.facing_right { 0.0 } else { std::f32::consts::PI };"
-            // "let game_rotation_y = Mat3::from_rotation_y(facing_angle);"
-            // "let game_transform = game_translation * game_rotation;"
-            
-            // If we change render_player to handle rotation manually, we need to replicate that here or receive the full world matrix?
-            // For now let's stick to what was there but use aim_angle for initial direction if needed?
-            // Actually, calculating proper muzzle position is hard without the full transform chain.
-            // Let's assume render_player still works similarly but we might need to adjust "game_rotation_y" if we change how player is rotated.
-            
-            // If render_player does "complex rotations", it modifies how the model sits in world.
-            // We should use the same logic here or refactor.
-            // For MVP, since we only change how model is RENDERED (visuals), the actual logic for "direction" is simple.
-            
-            let facing_angle = if player.facing_right { 0.0 } else { std::f32::consts::PI };
-            let md3_correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
-            let facing_rotation = Mat3::from_rotation_y(facing_angle);
-            let combined_rotation = facing_rotation * md3_correction;
-            
-            let ground_y = self.world.map.ground_y;
-            let lower_frame = 0;
-            let model_bottom_offset = Self::calculate_model_bottom_offset(self.player_model.lower.as_ref(), lower_frame);
-            let render_y = ground_y + model_bottom_offset + player.y;
-            let game_translation = Mat4::from_translation(Vec3::new(player.x, render_y, 50.0));
-            
-            // Note: If we implement complex rotations (leaning), the barrel position will change.
-            // Ideally we need the final world matrix of the weapon tag.
-            // For now, let's keep it approximate or we might break shooting origin.
-            
-            let game_rotation = Mat4::from_mat3(combined_rotation);
-            let game_transform = game_translation * game_rotation;
-            let scale_mat = Mat4::from_scale(Vec3::splat(scale));
-            
-            let barrel_offset = Vec3::new(25.0, 0.0, 5.0);
-            let barrel_local_pos = weapon_orient.origin + 
-                weapon_orient.axis[0] * barrel_offset.x +
-                weapon_orient.axis[1] * barrel_offset.y +
-                weapon_orient.axis[2] * barrel_offset.z;
-            
-            let barrel_scaled = scale_mat.transform_point3(barrel_local_pos);
-            let barrel_world = game_transform.transform_point3(barrel_scaled);
-            
-            barrel_world
-        } else {
-            let ground_y = self.world.map.ground_y;
-            let lower_frame = 0;
-            let model_bottom_offset = Self::calculate_model_bottom_offset(self.player_model.lower.as_ref(), lower_frame);
-            let render_y = ground_y + model_bottom_offset + player.y;
-            Vec3::new(player.x, render_y + 0.5, 50.0)
-        };
-
-        let direction = Vec3::new(aim_angle.cos(), aim_angle.sin(), 0.0); // Shoot towards aim!
-        // Note: sin/cos mapping. 0 is Right (1,0). PI/2 (0,1) Up.
-        // Assuming aim_angle is standard math angle.
-        
-        // However, in our world, Y is Up. Screen Y is Down.
-        // If we calculated aim_angle using -dy, then +angle is Up.
-        // So this direction vector (cos, sin, 0) is correct for World (X, Y).
-        
-        let frustum = Frustum::from_view_proj(view_proj);
-        self.world.rockets.push(Rocket::new(rocket_position, direction, sas2::game::constants::ROCKET_SPEED, &frustum, self.local_player_id));
-        let time = self.start_time.elapsed().as_secs_f32();
-        self.last_shot_time = time;
-        self.is_shooting = true;
-        self.shoot_anim_start_time = time;
     }
 
     fn find_tag<'a>(tags: &'a [sas2::engine::md3::Tag], name: &str) -> Option<&'a sas2::engine::md3::Tag> {
@@ -898,6 +848,32 @@ impl ApplicationHandler for GameApp {
                 load_rocket_textures_static(&mut wgpu_renderer, &mut md3_renderer, rocket);
         }
 
+        let mut unique_item_types = HashSet::new();
+        for item in &self.world.map.items {
+            unique_item_types.insert(item.item_type);
+        }
+        for item_type in unique_item_types {
+            let model_path = Self::item_model_path(item_type);
+            let scale = Self::item_model_scale(item_type);
+            if let Some(model) = Self::load_static_model(&mut wgpu_renderer, &mut md3_renderer, model_path, scale) {
+                self.item_models.insert(item_type, model);
+            }
+        }
+
+        self.teleporter_marker = Self::load_static_model(
+            &mut wgpu_renderer,
+            &mut md3_renderer,
+            "q3-resources/models/powerups/holdable/teleporter.md3",
+            2.0,
+        );
+
+        self.jumppad_marker = Self::load_static_model(
+            &mut wgpu_renderer,
+            &mut md3_renderer,
+            "q3-resources/models/mapobjects/podium/podium4.md3",
+            0.6,
+        );
+
         self.window = Some(window.clone());
         self.wgpu_renderer = Some(wgpu_renderer);
         self.md3_renderer = Some(md3_renderer);
@@ -933,12 +909,12 @@ impl ApplicationHandler for GameApp {
                         KeyCode::KeyD => self.move_right = pressed,
                         KeyCode::KeyW => self.jump_pressed = pressed,
                         KeyCode::KeyS => self.crouch_pressed = pressed,
-                        KeyCode::KeyQ => self.camera_move_x_neg = pressed,
-                        KeyCode::KeyE => self.camera_move_x_pos = pressed,
                         KeyCode::KeyR => self.camera_move_z_neg = pressed,
                         KeyCode::KeyF => self.camera_move_z_pos = pressed,
-                        KeyCode::KeyZ => self.camera_move_y_neg = pressed,
-                        KeyCode::KeyX => self.camera_move_y_pos = pressed,
+                        KeyCode::ArrowUp => self.camera_pitch_up = pressed,
+                        KeyCode::ArrowDown => self.camera_pitch_down = pressed,
+                        KeyCode::ArrowLeft => self.camera_yaw_left = pressed,
+                        KeyCode::ArrowRight => self.camera_yaw_right = pressed,
                         KeyCode::Space => {
                             self.shoot_pressed = pressed;
                         }
@@ -987,26 +963,34 @@ impl ApplicationHandler for GameApp {
 
                 self.update_fps_counter(now);
 
-                // Update Camera
+                if let Some(player) = self.world.players.get(self.local_player_id as usize) {
+                    self.camera.follow(player.x, player.y);
+                }
+                self.camera.update(dt, &self.world.map);
+
                 let camera_speed = 20.0;
-                if self.camera_move_x_neg {
-                    self.camera.x -= camera_speed * dt;
-                }
-                if self.camera_move_x_pos {
-                    self.camera.x += camera_speed * dt;
-                }
-                if self.camera_move_y_neg {
-                    self.camera.y -= camera_speed * dt;
-                }
-                if self.camera_move_y_pos {
-                    self.camera.y += camera_speed * dt;
-                }
                 if self.camera_move_z_neg {
                     self.camera.z -= camera_speed * dt;
                 }
                 if self.camera_move_z_pos {
                     self.camera.z += camera_speed * dt;
                 }
+
+                let angle_speed = 1.5;
+                if self.camera_pitch_up {
+                    self.camera.pitch += angle_speed * dt;
+                }
+                if self.camera_pitch_down {
+                    self.camera.pitch -= angle_speed * dt;
+                }
+                if self.camera_yaw_left {
+                    self.camera.yaw -= angle_speed * dt;
+                }
+                if self.camera_yaw_right {
+                    self.camera.yaw += angle_speed * dt;
+                }
+                self.camera.pitch = self.camera.pitch.clamp(-1.5, 1.5);
+                self.camera.yaw = self.camera.yaw.clamp(-1.5, 1.5);
 
                 // Update World
                 let (width, height) = if let Some(ref wgpu_renderer) = self.wgpu_renderer {
@@ -1021,10 +1005,27 @@ impl ApplicationHandler for GameApp {
                 if let Some(player) = self.world.players.get_mut(self.local_player_id as usize) {
                     let aim_angle = self.aim_y.atan2(self.aim_x);
                     
-                    player.update(dt, self.move_left, self.move_right, self.jump_pressed, self.crouch_pressed, self.world.map.ground_y, aim_angle);
+                    player.update(dt, self.move_left, self.move_right, self.jump_pressed, self.crouch_pressed, &mut self.world.map, aim_angle);
                 }
                 
                 self.world.update(dt, &frustum);
+
+                let now_debug = Instant::now();
+                if now_debug.duration_since(self.last_debug_log).as_secs_f32() >= 1.0 {
+                    if let Some(player) = self.world.players.get(self.local_player_id as usize) {
+                        println!("=== DEBUG: Player pos=({:.2}, {:.2}), Teleporters count={}", 
+                            player.x, player.y, self.world.map.teleporters.len());
+                        for (i, tp) in self.world.map.teleporters.iter().enumerate() {
+                            let center_x = tp.x + tp.width * 0.5;
+                            let center_y = tp.y + tp.height * 0.5;
+                            let dist = ((player.x - center_x).powi(2) + (player.y - center_y).powi(2)).sqrt();
+                            println!("  Teleporter[{}]: bottom_left=({:.2}, {:.2}) center=({:.2}, {:.2}) size=({:.2}, {:.2}) dest=({:.2}, {:.2}), dist_to_player={:.2}, marker={}", 
+                                i, tp.x, tp.y, center_x, center_y, tp.width, tp.height, tp.dest_x, tp.dest_y, dist,
+                                if self.teleporter_marker.is_some() { "loaded" } else { "NOT LOADED" });
+                        }
+                    }
+                    self.last_debug_log = now_debug;
+                }
 
                 // Rendering
                 let player = match self.world.players.get(self.local_player_id as usize) {
@@ -1043,6 +1044,7 @@ impl ApplicationHandler for GameApp {
                 let player_facing_right = normalized_angle.abs() < std::f32::consts::FRAC_PI_2;
 
                 let player_is_moving = player.is_moving;
+                let player_is_moving_backward = player.is_moving_backward;
                 let player_animation_time = player.animation_time;
                 let player_state = player.state;
                 let player_is_crouching = player.is_crouching;
@@ -1052,6 +1054,7 @@ impl ApplicationHandler for GameApp {
                     .map(|lower| Self::calculate_legs_frame(
                         &self.player_model.anim_config,
                         player_is_moving,
+                        player_is_moving_backward,
                         player_animation_time,
                         lower,
                         player_state,
@@ -1098,6 +1101,7 @@ impl ApplicationHandler for GameApp {
                 let player2_lower_frame = self.player2_model.lower.as_ref()
                     .map(|lower| Self::calculate_legs_frame(
                         &self.player2_model.anim_config,
+                        false,
                         false,
                         elapsed_time,
                         lower,
@@ -1185,7 +1189,11 @@ impl ApplicationHandler for GameApp {
                 let frustum = Frustum::from_view_proj(view_proj);
 
                 // Lighting
-                let lighting = LightingParams::new();
+                let lighting = if !self.world.map.lights.is_empty() {
+                    LightingParams::from_map_lights(&self.world.map.lights)
+                } else {
+                    LightingParams::new()
+                };
                 let time = self.start_time.elapsed().as_secs_f32();
                 
                 let mut dynamic_lights = Vec::new();
@@ -1240,6 +1248,93 @@ impl ApplicationHandler for GameApp {
                     surface_format,
                 );
 
+                let md3_correction_items = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+                let item_spin = Mat3::from_rotation_y(time * 1.2);
+                let item_rotation = Mat4::from_mat3(item_spin * md3_correction_items);
+
+                for item in &self.world.map.items {
+                    if !item.active {
+                        continue;
+                    }
+                    let Some(model) = self.item_models.get(&item.item_type) else {
+                        continue;
+                    };
+
+                    let bob = (time * 2.0).sin() * 6.0;
+                    let translation = Mat4::from_translation(Vec3::new(item.x, item.y + bob, 50.0));
+                    let scale_mat = Mat4::from_scale(Vec3::splat(model.scale));
+                    let model_mat = translation * item_rotation * scale_mat;
+
+                    md3_renderer.render_model(
+                        &mut encoder,
+                        &view,
+                        depth_view,
+                        surface_format,
+                        &model.model,
+                        0,
+                        &model.textures,
+                        model_mat,
+                        view_proj,
+                        camera_pos,
+                        &all_lights,
+                        lighting.ambient,
+                        false,
+                    );
+                }
+
+                if let Some(marker) = self.teleporter_marker.as_ref() {
+                    let spin = Mat4::from_mat3(Mat3::from_rotation_y(time * 0.8) * md3_correction_items);
+                    for tp in &self.world.map.teleporters {
+                        let translation = Mat4::from_translation(Vec3::new(tp.x, tp.y, 50.0));
+                        let scale_mat = Mat4::from_scale(Vec3::splat(marker.scale));
+                        let model_mat = translation * spin * scale_mat;
+
+                        md3_renderer.render_model(
+                            &mut encoder,
+                            &view,
+                            depth_view,
+                            surface_format,
+                            &marker.model,
+                            0,
+                            &marker.textures,
+                            model_mat,
+                            view_proj,
+                            camera_pos,
+                            &all_lights,
+                            lighting.ambient,
+                            false,
+                        );
+                    }
+                }
+
+                if let Some(marker) = self.jumppad_marker.as_ref() {
+                    let jumppad_rotation = Mat3::from_rotation_x(std::f32::consts::FRAC_PI_2) * md3_correction_items;
+                    let spin = Mat4::from_mat3(Mat3::from_rotation_y(time * 0.8) * jumppad_rotation);
+                    for jp in &self.world.map.jumppads {
+                        let x = jp.x + jp.width * 0.5;
+                        let y = jp.y;
+                        let translation = Mat4::from_translation(Vec3::new(x, y, 50.0));
+                        let scale_mat = Mat4::from_scale(Vec3::splat(marker.scale));
+                        let model_mat = translation * spin * scale_mat;
+
+                        md3_renderer.render_model(
+                            &mut encoder,
+                            &view,
+                            depth_view,
+                            surface_format,
+                            &marker.model,
+                            0,
+                            &marker.textures,
+                            model_mat,
+                            view_proj,
+                            camera_pos,
+                            &all_lights,
+                            lighting.ambient,
+                            false,
+                        );
+                    }
+                }
+
                 let scale = 1.0;
                 let scale_mat = Mat4::from_scale(Vec3::splat(scale));
 
@@ -1273,7 +1368,7 @@ impl ApplicationHandler for GameApp {
                 let game_rotation = Mat4::from_mat3(combined_rotation);
                 let game_transform = game_translation * game_rotation;
 
-                let (weapon_orientation, mut shadow_models) = Self::render_player(
+                let (_weapon_orientation, mut shadow_models) = Self::render_player(
                     &mut encoder,
                     &view,
                     depth_view,
@@ -1310,7 +1405,7 @@ impl ApplicationHandler for GameApp {
                 let player2_game_rotation = Mat4::from_mat3(player2_combined_rotation);
                 let player2_game_transform = player2_game_translation * player2_game_rotation;
 
-                let (player2_weapon_orientation, player2_shadow_models) = Self::render_player(
+                let (_player2_weapon_orientation, player2_shadow_models) = Self::render_player(
                     &mut encoder,
                     &view,
                     depth_view,
@@ -1506,7 +1601,10 @@ impl ApplicationHandler for GameApp {
                 wgpu_renderer.end_frame(frame);
                 
                 if should_shoot {
-                    self.shoot_rocket(view_proj, weapon_orientation, player_aim_angle);
+                    if self.world.try_fire(self.local_player_id, player_aim_angle, &frustum) {
+                        self.is_shooting = true;
+                        self.shoot_anim_start_time = elapsed_time;
+                    }
                 }
                 
                 let total_time = frame_start.elapsed();

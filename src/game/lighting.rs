@@ -102,4 +102,35 @@ impl LightingParams {
             ambient: 0.015,
         }
     }
+
+    pub fn from_map_lights(map_lights: &[super::map::LightSource]) -> Self {
+        let lights: Vec<Light> = map_lights
+            .iter()
+            .map(|ls| {
+                let position = Vec3::new(ls.x, ls.y, 400.0);
+                let color = Vec3::new(
+                    ls.r as f32 / 255.0,
+                    ls.g as f32 / 255.0,
+                    ls.b as f32 / 255.0,
+                ) * ls.intensity;
+                
+                if ls.flicker {
+                    Light::with_randomized_flicker(
+                        position,
+                        color,
+                        ls.radius * 20.0,
+                        8.0,
+                        0.15,
+                    )
+                } else {
+                    Light::new(position, color, ls.radius * 20.0)
+                }
+            })
+            .collect();
+
+        Self {
+            lights,
+            ambient: 0.015,
+        }
+    }
 }

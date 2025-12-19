@@ -13,7 +13,7 @@ impl TileMeshes {
 
         let tile_width = map.tile_width;
         let tile_height = map.tile_height;
-        let depth_thickness = 8.0;
+        let depth_thickness = 80.0;
         let origin_x = -(map.width as f32 * tile_width) * 0.5;
 
         for x in 0..map.width {
@@ -39,7 +39,7 @@ impl TileMeshes {
                     world_y,
                     tile_width,
                     tile_height,
-                    0.0,
+                    -depth_thickness,
                 );
 
                 if !left_solid {
@@ -52,6 +52,7 @@ impl TileMeshes {
                         0.0,
                         -depth_thickness,
                         [-1.0, 0.0, 0.0],
+                        false,
                     );
                 }
 
@@ -65,6 +66,7 @@ impl TileMeshes {
                         0.0,
                         -depth_thickness,
                         [1.0, 0.0, 0.0],
+                        true,
                     );
                 }
 
@@ -78,6 +80,7 @@ impl TileMeshes {
                         0.0,
                         -depth_thickness,
                         [0.0, 1.0, 0.0],
+                        false,
                     );
                 }
 
@@ -91,6 +94,7 @@ impl TileMeshes {
                         0.0,
                         -depth_thickness,
                         [0.0, -1.0, 0.0],
+                        true,
                     );
                 }
             }
@@ -115,25 +119,25 @@ fn add_front_quad_xy(
         position: [x, y, z],
         uv: [0.0, 0.0],
         color: [1.0, 1.0, 1.0, 1.0],
-        normal: [0.0, 0.0, 1.0],
+        normal: [0.0, 0.0, -1.0],
     });
     vertices.push(VertexData {
         position: [x + width, y, z],
         uv: [1.0, 0.0],
         color: [1.0, 1.0, 1.0, 1.0],
-        normal: [0.0, 0.0, 1.0],
+        normal: [0.0, 0.0, -1.0],
     });
     vertices.push(VertexData {
         position: [x + width, y + height, z],
         uv: [1.0, 1.0],
         color: [1.0, 1.0, 1.0, 1.0],
-        normal: [0.0, 0.0, 1.0],
+        normal: [0.0, 0.0, -1.0],
     });
     vertices.push(VertexData {
         position: [x, y + height, z],
         uv: [0.0, 1.0],
         color: [1.0, 1.0, 1.0, 1.0],
-        normal: [0.0, 0.0, 1.0],
+        normal: [0.0, 0.0, -1.0],
     });
 
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -148,6 +152,7 @@ fn add_side_quad_x(
     z0: f32,
     z1: f32,
     normal: [f32; 3],
+    reverse_winding: bool,
 ) {
     let base = vertices.len() as u16;
 
@@ -176,7 +181,11 @@ fn add_side_quad_x(
         normal,
     });
 
-    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    if reverse_winding {
+        indices.extend_from_slice(&[base, base + 3, base + 2, base, base + 2, base + 1]);
+    } else {
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
 }
 
 fn add_side_quad_y(
@@ -188,6 +197,7 @@ fn add_side_quad_y(
     z0: f32,
     z1: f32,
     normal: [f32; 3],
+    reverse_winding: bool,
 ) {
     let base = vertices.len() as u16;
 
@@ -216,5 +226,9 @@ fn add_side_quad_y(
         normal,
     });
 
-    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    if reverse_winding {
+        indices.extend_from_slice(&[base, base + 3, base + 2, base, base + 2, base + 1]);
+    } else {
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
 }

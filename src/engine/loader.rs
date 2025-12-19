@@ -1,6 +1,7 @@
 use wgpu::{Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, ImageCopyTexture, Origin3d, TextureAspect, ImageDataLayout, TextureViewDescriptor, SamplerDescriptor, FilterMode, AddressMode};
 use crate::engine::renderer::{WgpuRenderer, MD3Renderer, WgpuTexture};
 use crate::engine::md3::MD3Model;
+use std::path::Path;
 
 pub fn load_textures_for_model_static(
     wgpu_renderer: &mut WgpuRenderer,
@@ -369,3 +370,126 @@ pub fn load_rocket_textures_static(
     texture_paths
 }
 
+pub fn load_md3_textures_guess_static(
+    wgpu_renderer: &mut WgpuRenderer,
+    md3_renderer: &mut MD3Renderer,
+    model: &MD3Model,
+    model_path: &str,
+) -> Vec<Option<String>> {
+    let path = Path::new(model_path);
+    let base_dir_raw = path.parent().and_then(|p| p.to_str()).unwrap_or("");
+    let base_dir = base_dir_raw
+        .trim_start_matches("../")
+        .trim_start_matches("q3-resources/");
+    let base_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+
+    let mut texture_paths = Vec::new();
+
+    for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
+        let raw_name = std::str::from_utf8(&mesh.header.name).unwrap_or("").trim_end_matches('\0');
+        let mesh_name = if raw_name.is_empty() || raw_name == "default" {
+            base_name
+        } else {
+            raw_name
+        };
+
+        let mut candidate_names = Vec::new();
+        if !mesh_name.is_empty() {
+            candidate_names.push(mesh_name.to_string());
+        }
+        if !base_name.is_empty() && base_name != mesh_name {
+            candidate_names.push(base_name.to_string());
+        }
+
+        if !base_name.is_empty() {
+            candidate_names.push(format!("{}{}", base_name, mesh_idx + 1));
+            candidate_names.push(format!("{}{}", base_name, mesh_idx + 2));
+            candidate_names.push(format!("{}3", base_name));
+            candidate_names.push(format!("{}4", base_name));
+        }
+
+        candidate_names.dedup();
+
+        let mut found: Option<String> = None;
+        for name in candidate_names {
+            let candidates = [
+                format!("q3-resources/{}/{}.png", base_dir, name),
+                format!("q3-resources/{}/{}.jpg", base_dir, name),
+                format!("q3-resources/{}/{}.tga", base_dir, name),
+                format!("q3-resources/{}/{}.TGA", base_dir, name),
+                format!("../q3-resources/{}/{}.png", base_dir, name),
+                format!("../q3-resources/{}/{}.jpg", base_dir, name),
+                format!("../q3-resources/{}/{}.tga", base_dir, name),
+                format!("../q3-resources/{}/{}.TGA", base_dir, name),
+            ];
+
+            for candidate in candidates {
+                if !Path::new(&candidate).exists() {
+                    continue;
+                }
+                if let Ok(data) = std::fs::read(&candidate) {
+                    if let Ok(img) = image::load_from_memory(&data) {
+                        let img = img.to_rgba8();
+                        let size = Extent3d {
+                            width: img.width(),
+                            height: img.height(),
+                            depth_or_array_layers: 1,
+                        };
+                        let texture = wgpu_renderer.device.create_texture(&TextureDescriptor {
+                            label: Some("MD3 Guess Texture"),
+                            size,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: TextureDimension::D2,
+                            format: TextureFormat::Rgba8UnormSrgb,
+                            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+
+                        wgpu_renderer.queue.write_texture(
+                            ImageCopyTexture {
+                                texture: &texture,
+                                mip_level: 0,
+                                origin: Origin3d::ZERO,
+                                aspect: TextureAspect::All,
+                            },
+                            &img,
+                            ImageDataLayout {
+                                offset: 0,
+                                bytes_per_row: Some(4 * img.width()),
+                                rows_per_image: Some(img.height()),
+                            },
+                            size,
+                        );
+
+                        let view = texture.create_view(&TextureViewDescriptor::default());
+                        let sampler = wgpu_renderer.device.create_sampler(&SamplerDescriptor {
+                            address_mode_u: AddressMode::Repeat,
+                            address_mode_v: AddressMode::Repeat,
+                            address_mode_w: AddressMode::Repeat,
+                            mag_filter: FilterMode::Linear,
+                            min_filter: FilterMode::Linear,
+                            mipmap_filter: FilterMode::Linear,
+                            ..Default::default()
+                        });
+
+                        let wgpu_tex = WgpuTexture { texture, view, sampler };
+
+                        let key = candidate.trim_start_matches("../").to_string();
+                        md3_renderer.load_texture(&key, wgpu_tex);
+                        found = Some(key);
+                        break;
+                    }
+                }
+            }
+
+            if found.is_some() {
+                break;
+            }
+        }
+
+        texture_paths.push(found);
+    }
+
+    texture_paths
+}

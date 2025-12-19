@@ -96,6 +96,8 @@ impl MapFile {
     }
 
     pub fn to_map(&self) -> Map {
+        let origin_x = -((self.width as f32) * self.tile_width) * 0.5;
+        let origin_y = (self.height as f32 - 1.0) * self.tile_height;
         let mut tiles = vec![
             vec![
                 Tile {
@@ -134,8 +136,8 @@ impl MapFile {
             .spawn_points
             .iter()
             .map(|sp| SpawnPoint {
-                x: sp.tile_x * self.tile_width,
-                y: sp.tile_y * self.tile_height,
+                x: origin_x + sp.tile_x * self.tile_width,
+                y: origin_y - sp.tile_y * self.tile_height,
                 team: sp.team,
             })
             .collect();
@@ -166,8 +168,8 @@ impl MapFile {
                     _ => return None,
                 };
                 Some(Item {
-                    x: item.tile_x * self.tile_width,
-                    y: item.tile_y * self.tile_height,
+                    x: origin_x + item.tile_x * self.tile_width,
+                    y: origin_y - item.tile_y * self.tile_height,
                     item_type,
                     respawn_time: 0,
                     active: true,
@@ -188,8 +190,8 @@ impl MapFile {
             .jumppads
             .iter()
             .map(|jp| JumpPad {
-                x: jp.tile_x * self.tile_width,
-                y: jp.tile_y * self.tile_height,
+                x: origin_x + jp.tile_x * self.tile_width,
+                y: origin_y - jp.tile_y * self.tile_height,
                 width: jp.width_tiles * self.tile_width,
                 force_x: jp.force_x,
                 force_y: jp.force_y,
@@ -201,12 +203,12 @@ impl MapFile {
             .teleporters
             .iter()
             .map(|tp| Teleporter {
-                x: tp.tile_x * self.tile_width,
-                y: tp.tile_y * self.tile_height,
+                x: origin_x + tp.tile_x * self.tile_width,
+                y: origin_y - tp.tile_y * self.tile_height,
                 width: tp.width_tiles * self.tile_width,
                 height: tp.height_tiles * self.tile_height,
-                dest_x: tp.dest_tile_x * self.tile_width,
-                dest_y: tp.dest_tile_y * self.tile_height,
+                dest_x: origin_x + tp.dest_tile_x * self.tile_width,
+                dest_y: origin_y - tp.dest_tile_y * self.tile_height,
             })
             .collect();
 

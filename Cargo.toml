@@ -7,6 +7,10 @@ edition = "2021"
 name = "sas2"
 path = "src/lib.rs"
 
+[[bin]]
+name = "md3_viewer"
+path = "src/bin/md3_viewer.rs"
+
 [dependencies]
 wgpu = "0.20"
 winit = "0.30"

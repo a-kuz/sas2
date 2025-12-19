@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::hash::Hash;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Map {
@@ -105,7 +106,10 @@ impl JumpPad {
     }
 
     pub fn check_collision(&self, px: f32, py: f32) -> bool {
-        px >= self.x && px <= self.x + self.width && py >= self.y - 20.0 && py <= self.y + 20.0
+        let in_x = px >= self.x && px <= self.x + self.width;
+        let y_diff = py - self.y;
+        let in_y = y_diff >= -10.0 && y_diff <= 10.0;
+        in_x && in_y
     }
 }
 
@@ -131,7 +135,7 @@ pub struct LightSource {
     pub flicker: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ItemType {
     Health25,
     Health50,
@@ -199,11 +203,42 @@ impl Map {
         self.tiles[tile_x as usize][tile_y as usize].solid
     }
 
+    #[inline]
+    pub fn origin_x(&self) -> f32 {
+        -(self.width as f32 * self.tile_width) * 0.5
+    }
+
+    #[inline]
+    pub fn world_to_tile_x(&self, world_x: f32) -> i32 {
+        let local_x = world_x - self.origin_x();
+        (local_x / self.tile_width).floor() as i32
+    }
+
+    #[inline]
+    pub fn world_to_tile_y(&self, world_y: f32) -> i32 {
+        let from_bottom = (world_y / self.tile_height).floor() as i32;
+        (self.height as i32 - 1) - from_bottom
+    }
+
+    #[inline]
+    pub fn is_solid_world(&self, world_x: f32, world_y: f32) -> bool {
+        self.is_solid(self.world_to_tile_x(world_x), self.world_to_tile_y(world_y))
+    }
+
     pub fn map_width(&self) -> usize {
         self.width
     }
 
     pub fn map_height(&self) -> usize {
         self.height
+    }
+
+    pub fn find_safe_spawn_position(&self) -> (f32, f32) {
+        if !self.spawn_points.is_empty() {
+            let sp = &self.spawn_points[0];
+            (sp.x, sp.y)
+        } else {
+            (0.0, 100.0)
+        }
     }
 }
