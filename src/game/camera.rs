@@ -29,8 +29,9 @@ impl Camera {
         self.target_y = player_y + 59.0;
     }
 
-    pub fn update(&mut self, dt: f32, map: &Map) {
+    pub fn update(&mut self, dt: f32, map: &Map, aspect: f32) {
         const SMOOTHNESS: f32 = 3.0;
+        const FOV: f32 = std::f32::consts::PI / 4.0;
 
         self.x += (self.target_x - self.x) * SMOOTHNESS * dt;
         self.y += (self.target_y - self.y) * SMOOTHNESS * dt;
@@ -38,17 +39,31 @@ impl Camera {
         let map_width_world = map.width as f32 * map.tile_width;
         let map_height_world = map.height as f32 * map.tile_height;
 
-        let half_view_width = 30.0;
-        let half_view_height = 20.0;
+        let distance_to_ground = self.z;
+        let half_view_height = distance_to_ground * (FOV * 0.5).tan();
+        let half_view_width = half_view_height * aspect;
 
-        self.x = self.x.clamp(
-            map.origin_x() + half_view_width,
-            map.origin_x() + map_width_world - half_view_width,
-        );
-        self.y = self.y.clamp(
-            half_view_height,
-            map_height_world + 59.0,
-        );
+        let map_left = map.origin_x();
+        let map_right = map.origin_x() + map_width_world;
+        let map_bottom = map.ground_y;
+        let map_top = map.ground_y + map_height_world;
+
+        let min_x = map_left + half_view_width;
+        let max_x = map_right - half_view_width;
+        let min_y = map_bottom + half_view_height;
+        let max_y = map_top - half_view_height;
+
+        if max_x > min_x {
+            self.x = self.x.clamp(min_x, max_x);
+        } else {
+            self.x = (map_left + map_right) * 0.5;
+        }
+
+        if max_y > min_y {
+            self.y = self.y.clamp(min_y, max_y);
+        } else {
+            self.y = (map_bottom + map_top) * 0.5;
+        }
     }
 
     pub fn get_view_proj(&self, aspect: f32) -> (Mat4, Vec3) {

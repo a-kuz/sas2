@@ -31,6 +31,8 @@ use sas2::game::lighting::{LightingParams, Light};
 // use sas2::game::player::Player;
 use sas2::game::map::ItemType;
 
+const WORLD_Z: f32 = 0.0;
+
 struct PlayerModel {
     lower: Option<MD3Model>,
     upper: Option<MD3Model>,
@@ -507,16 +509,6 @@ impl GameApp {
         let mut shadow_models = Vec::new();
         
         let pitch = if flip_x {
-            std::f32::consts::PI - aim_angle
-        } else {
-            aim_angle
-        };
-        // Normalize pitch to -PI to PI
-        let pitch = pitch.atan2(1.0).atan2(1.0) * 0.0 + pitch; // Just a dummy op, but I should normalize correctly.
-        // Actually simpler:
-        // Since we inverted aim_y in the input system (screen Y down = world Y down),
-        // we need to negate aim_angle here to make rotations work correctly
-        let pitch = if flip_x {
             let mut p = std::f32::consts::PI - (-aim_angle);
             while p > std::f32::consts::PI { p -= 2.0 * std::f32::consts::PI; }
             while p < -std::f32::consts::PI { p += 2.0 * std::f32::consts::PI; }
@@ -771,9 +763,9 @@ impl ApplicationHandler for GameApp {
         }
         
         if let (Some(ref lower), Some(ref upper), Some(ref head)) = (&self.player_model.lower, &self.player_model.upper, &self.player_model.head) {
-            let (lower_min_x, lower_max_x, lower_min_y, lower_max_y, lower_min_z, lower_max_z) = lower.get_bounds(0);
-            let (upper_min_x, upper_max_x, upper_min_y, upper_max_y, upper_min_z, upper_max_z) = upper.get_bounds(0);
-            let (head_min_x, head_max_x, head_min_y, head_max_y, head_min_z, head_max_z) = head.get_bounds(0);
+            let (_lower_min_x, _lower_max_x, lower_min_y, lower_max_y, lower_min_z, lower_max_z) = lower.get_bounds(0);
+            let (_upper_min_x, _upper_max_x, upper_min_y, upper_max_y, upper_min_z, upper_max_z) = upper.get_bounds(0);
+            let (_head_min_x, _head_max_x, head_min_y, head_max_y, head_min_z, head_max_z) = head.get_bounds(0);
             
             let total_min_z = lower_min_z.min(upper_min_z).min(head_min_z);
             let total_max_z = lower_max_z.max(upper_max_z).max(head_max_z);
@@ -966,7 +958,13 @@ impl ApplicationHandler for GameApp {
                 if let Some(player) = self.world.players.get(self.local_player_id as usize) {
                     self.camera.follow(player.x, player.y);
                 }
-                self.camera.update(dt, &self.world.map);
+                let (width, height) = if let Some(ref wgpu_renderer) = self.wgpu_renderer {
+                    wgpu_renderer.get_viewport_size()
+                } else {
+                    return;
+                };
+                let aspect = width as f32 / height as f32;
+                self.camera.update(dt, &self.world.map, aspect);
 
                 let camera_speed = 20.0;
                 if self.camera_move_z_neg {
@@ -1097,18 +1095,6 @@ impl ApplicationHandler for GameApp {
                         }
                     }
                 }
-
-                let player2_lower_frame = self.player2_model.lower.as_ref()
-                    .map(|lower| Self::calculate_legs_frame(
-                        &self.player2_model.anim_config,
-                        false,
-                        false,
-                        elapsed_time,
-                        lower,
-                        sas2::game::player::PlayerState::Ground,
-                        false
-                    ))
-                    .unwrap_or(0);
 
                 let player2_gesture_time = elapsed_time - self.player2_gesture_start_time;
                 let player2_upper_frame = self.player2_model.upper.as_ref()
@@ -1260,8 +1246,7 @@ impl ApplicationHandler for GameApp {
                         continue;
                     };
 
-                    let bob = (time * 2.0).sin() * 6.0;
-                    let translation = Mat4::from_translation(Vec3::new(item.x, item.y + bob, 50.0));
+                    let translation = Mat4::from_translation(Vec3::new(item.x, item.y, WORLD_Z));
                     let scale_mat = Mat4::from_scale(Vec3::splat(model.scale));
                     let model_mat = translation * item_rotation * scale_mat;
 
@@ -1285,7 +1270,7 @@ impl ApplicationHandler for GameApp {
                 if let Some(marker) = self.teleporter_marker.as_ref() {
                     let spin = Mat4::from_mat3(Mat3::from_rotation_y(time * 0.8) * md3_correction_items);
                     for tp in &self.world.map.teleporters {
-                        let translation = Mat4::from_translation(Vec3::new(tp.x, tp.y, 50.0));
+                        let translation = Mat4::from_translation(Vec3::new(tp.x, tp.y, WORLD_Z));
                         let scale_mat = Mat4::from_scale(Vec3::splat(marker.scale));
                         let model_mat = translation * spin * scale_mat;
 
@@ -1313,7 +1298,7 @@ impl ApplicationHandler for GameApp {
                     for jp in &self.world.map.jumppads {
                         let x = jp.x + jp.width * 0.5;
                         let y = jp.y;
-                        let translation = Mat4::from_translation(Vec3::new(x, y, 50.0));
+                        let translation = Mat4::from_translation(Vec3::new(x, y, WORLD_Z));
                         let scale_mat = Mat4::from_scale(Vec3::splat(marker.scale));
                         let model_mat = translation * spin * scale_mat;
 
@@ -1334,9 +1319,6 @@ impl ApplicationHandler for GameApp {
                         );
                     }
                 }
-
-                let scale = 1.0;
-                let scale_mat = Mat4::from_scale(Vec3::splat(scale));
 
                 // Render Player
                 
@@ -1364,7 +1346,7 @@ impl ApplicationHandler for GameApp {
                 let ground_y = self.world.map.ground_y;
                 let model_bottom_offset = Self::calculate_model_bottom_offset(self.player_model.lower.as_ref(), lower_frame);
                 let render_y = ground_y + model_bottom_offset + player_y;
-                let game_translation = Mat4::from_translation(Vec3::new(player_x, render_y, 50.0));
+                let game_translation = Mat4::from_translation(Vec3::new(player_x, render_y, WORLD_Z));
                 let game_rotation = Mat4::from_mat3(combined_rotation);
                 let game_transform = game_translation * game_rotation;
 
@@ -1398,7 +1380,7 @@ impl ApplicationHandler for GameApp {
                 let player2_lower_frame = 0;
                 let model_bottom_offset = Self::calculate_model_bottom_offset(self.player2_model.lower.as_ref(), player2_lower_frame);
                 let player2_y = ground_y + model_bottom_offset;
-                let player2_game_translation = Mat4::from_translation(Vec3::new(250.0, player2_y, 50.0));
+                let player2_game_translation = Mat4::from_translation(Vec3::new(250.0, player2_y, WORLD_Z));
                 let md3_correction = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
                 let facing_rotation = Mat3::from_rotation_y(std::f32::consts::PI);
                 let player2_combined_rotation = facing_rotation * md3_correction;
@@ -1498,13 +1480,36 @@ impl ApplicationHandler for GameApp {
                     .map(|(model, frame, _textures, matrix)| (*model, *frame, *matrix))
                     .collect();
 
+                let model_positions: Vec<Vec3> = shadow_volume_models.iter()
+                    .map(|(_, _, matrix)| {
+                        let pos = matrix.col(3);
+                        Vec3::new(pos.x, pos.y, pos.z)
+                    })
+                    .collect();
+
+                let visible_lights: Vec<(Vec3, Vec3, f32)> = all_lights.iter()
+                    .filter(|(light_pos, _, _)| {
+                        model_positions.iter().any(|model_pos| {
+                            use sas2::render::tile_occlusion::dda_line_of_sight;
+                            dda_line_of_sight(
+                                light_pos.x,
+                                light_pos.y,
+                                model_pos.x,
+                                model_pos.y,
+                                &self.world.map,
+                            )
+                        })
+                    })
+                    .copied()
+                    .collect();
+
                 md3_renderer.render_planar_shadows(
                     &mut encoder,
                     &view,
                     depth_view,
                     view_proj,
                     &shadow_volume_models,
-                    &all_lights,
+                    &visible_lights,
                 );
 
                 // md3_renderer.render_debug_lights(
@@ -1536,7 +1541,7 @@ impl ApplicationHandler for GameApp {
                     let lower_frame = 0;
                     let model_bottom_offset = Self::calculate_model_bottom_offset(self.player_model.lower.as_ref(), lower_frame);
                     let player_center_y = ground_y + model_bottom_offset + player_y + 0.5;
-                    let player_center = Vec3::new(player_x, player_center_y, 50.0);
+                    let player_center = Vec3::new(player_x, player_center_y, WORLD_Z);
                     
                     let crosshair_world_x = player_center.x + self.aim_x * CROSSHAIR_DISTANCE;
                     let crosshair_world_y = player_center.y + self.aim_y * CROSSHAIR_DISTANCE;
@@ -1573,7 +1578,7 @@ impl ApplicationHandler for GameApp {
                     let lower_frame = 0;
                     let model_bottom_offset = Self::calculate_model_bottom_offset(self.player_model.lower.as_ref(), lower_frame);
                     let player_center_y = ground_y + model_bottom_offset + player_y + 0.5;
-                    let text_world_pos = Vec3::new(player_x, player_center_y + 2.0, 50.0);
+                    let text_world_pos = Vec3::new(player_x, player_center_y + 2.0, WORLD_Z);
                     let clip_pos = view_proj * glam::Vec4::new(text_world_pos.x, text_world_pos.y, text_world_pos.z, 1.0);
                     if clip_pos.w > 0.0 {
                         let ndc = Vec3::new(clip_pos.x, clip_pos.y, clip_pos.z) / clip_pos.w;

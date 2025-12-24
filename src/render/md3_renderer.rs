@@ -45,6 +45,9 @@ pub struct MD3Renderer {
     tile_uniform_buffer: Option<Buffer>,
     tile_bind_group: Option<BindGroup>,
     pub tile_pipeline: Option<RenderPipeline>,
+    tile_occlusion_texture: Option<TextureView>,
+    tile_map_params_buffer: Option<Buffer>,
+    tile_lightmap: Option<super::lightmap::Lightmap>,
     buffer_cache: HashMap<BufferCacheKey, CachedBuffers>,
     ground_uniform_buffer: Option<Buffer>,
     wall_uniform_buffer: Option<Buffer>,
@@ -128,6 +131,9 @@ impl MD3Renderer {
             tile_uniform_buffer: None,
             tile_bind_group: None,
             tile_pipeline: None,
+            tile_occlusion_texture: None,
+            tile_map_params_buffer: None,
+            tile_lightmap: None,
             buffer_cache: HashMap::new(),
             ground_uniform_buffer: None,
             wall_uniform_buffer: None,
@@ -1725,6 +1731,8 @@ impl MD3Renderer {
     pub fn load_map_tiles(&mut self, map: &crate::game::map::Map) {
         use crate::render::map_meshes::TileMeshes;
         use crate::render::textures_tile::create_tile_texture;
+        use crate::render::tile_occlusion::TileOcclusionData;
+        use crate::render::lightmap::Lightmap;
 
         let tile_meshes = TileMeshes::generate_from_map(map);
 
@@ -1751,6 +1759,29 @@ impl MD3Renderer {
         if self.tile_texture.is_none() {
             self.tile_texture = Some(create_tile_texture(&self.device, &self.queue));
         }
+
+        let occlusion_data = TileOcclusionData::from_map(&self.device, &self.queue, map);
+        self.tile_occlusion_texture = Some(occlusion_data.view);
+
+        let map_params = MapParams {
+            origin_x: map.origin_x(),
+            tile_width: map.tile_width,
+            tile_height: map.tile_height,
+            map_width: map.width as f32,
+            map_height: map.height as f32,
+            _padding: [0.0; 3],
+        };
+
+        let map_params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Map Params Buffer"),
+            contents: bytemuck::cast_slice(&[map_params]),
+            usage: BufferUsages::UNIFORM,
+        });
+
+        self.tile_map_params_buffer = Some(map_params_buffer);
+
+        let lightmap = Lightmap::bake_from_map(&self.device, &self.queue, map, 2);
+        self.tile_lightmap = Some(lightmap);
 
         println!("Loaded map tiles: {} vertices, {} indices", tile_meshes.vertices.len(), tile_meshes.indices.len());
     }
@@ -1789,6 +1820,10 @@ impl MD3Renderer {
         });
 
         let tile_texture = self.tile_texture.as_ref().unwrap();
+        let tile_occlusion_view = self.tile_occlusion_texture.as_ref().expect("Tile occlusion texture not loaded");
+        let map_params_buffer = self.tile_map_params_buffer.as_ref().expect("Map params buffer not loaded");
+        let lightmap = self.tile_lightmap.as_ref().expect("Lightmap not loaded");
+        
         let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
             label: Some("Tile Bind Group"),
             layout: &self.tile_bind_group_layout,
@@ -1804,6 +1839,22 @@ impl MD3Renderer {
                 BindGroupEntry {
                     binding: 2,
                     resource: BindingResource::Sampler(&tile_texture.sampler),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: BindingResource::TextureView(tile_occlusion_view),
+                },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: map_params_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 5,
+                    resource: BindingResource::TextureView(&lightmap.view),
+                },
+                BindGroupEntry {
+                    binding: 6,
+                    resource: BindingResource::Sampler(&lightmap.sampler),
                 },
             ],
         });

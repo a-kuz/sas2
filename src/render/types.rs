@@ -82,5 +82,14 @@ pub struct MeshRenderData {
     pub is_additive: bool,
 }
 
-
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct MapParams {
+    pub origin_x: f32,
+    pub tile_width: f32,
+    pub tile_height: f32,
+    pub map_width: f32,
+    pub map_height: f32,
+    pub _padding: [f32; 3],
+}
 

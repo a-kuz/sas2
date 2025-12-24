@@ -87,6 +87,10 @@ fn default_intensity() -> f32 {
     1.0
 }
 
+fn snap_tile_center(t: f32) -> f32 {
+    (t - 0.5).round() + 0.5
+}
+
 impl MapFile {
     pub fn load_from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let file = File::open(path)?;
@@ -136,8 +140,8 @@ impl MapFile {
             .spawn_points
             .iter()
             .map(|sp| SpawnPoint {
-                x: origin_x + sp.tile_x * self.tile_width,
-                y: origin_y - sp.tile_y * self.tile_height,
+                x: origin_x + snap_tile_center(sp.tile_x) * self.tile_width,
+                y: origin_y - snap_tile_center(sp.tile_y) * self.tile_height,
                 team: sp.team,
             })
             .collect();
@@ -168,8 +172,8 @@ impl MapFile {
                     _ => return None,
                 };
                 Some(Item {
-                    x: origin_x + item.tile_x * self.tile_width,
-                    y: origin_y - item.tile_y * self.tile_height,
+                    x: origin_x + snap_tile_center(item.tile_x) * self.tile_width,
+                    y: origin_y - snap_tile_center(item.tile_y) * self.tile_height,
                     item_type,
                     respawn_time: 0,
                     active: true,

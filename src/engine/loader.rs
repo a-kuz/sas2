@@ -408,9 +408,7 @@ pub fn load_md3_textures_guess_static(
             candidate_names.push(format!("{}4", base_name));
         }
 
-        candidate_names.dedup();
-
-        let mut found: Option<String> = None;
+        candidate_names.dedup();        let mut found: Option<String> = None;
         for name in candidate_names {
             let candidates = [
                 format!("q3-resources/{}/{}.png", base_dir, name),

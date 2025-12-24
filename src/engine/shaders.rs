@@ -665,6 +665,17 @@ struct Uniforms {
     _padding1: f32,
 }
 
+struct MapParams {
+    origin_x: f32,
+    tile_width: f32,
+    tile_height: f32,
+    map_width: f32,
+    map_height: f32,
+    _padding0: f32,
+    _padding1: f32,
+    _padding2: f32,
+}
+
 @group(0) @binding(0)
 var<uniform> uniforms: Uniforms;
 
@@ -673,6 +684,64 @@ var tile_texture: texture_2d<f32>;
 
 @group(0) @binding(2)
 var tile_sampler: sampler;
+
+@group(0) @binding(3)
+var solid_tiles: texture_2d<f32>;
+
+@group(0) @binding(4)
+var<uniform> map_params: MapParams;
+
+@group(0) @binding(5)
+var lightmap: texture_2d<f32>;
+
+@group(0) @binding(6)
+var lightmap_sampler: sampler;
+
+fn world_to_tile_coords(world_x: f32, world_y: f32) -> vec2<i32> {
+    let local_x = world_x - map_params.origin_x;
+    let tile_x = i32(floor(local_x / map_params.tile_width));
+    let from_bottom = i32(floor(world_y / map_params.tile_height));
+    let tile_y = i32(map_params.map_height) - 1 - from_bottom;
+    return vec2<i32>(tile_x, tile_y);
+}
+
+fn is_tile_solid(tile_x: i32, tile_y: i32) -> bool {
+    if (tile_x < 0 || tile_y < 0 || tile_x >= i32(map_params.map_width) || tile_y >= i32(map_params.map_height)) {
+        return true;
+    }
+    let solid_value = textureLoad(solid_tiles, vec2<i32>(tile_x, tile_y), 0).r;
+    return solid_value > 0.5;
+}
+
+fn is_occluded_by_tiles(from_xy: vec2<f32>, to_xy: vec2<f32>) -> bool {
+    let dx = to_xy.x - from_xy.x;
+    let dy = to_xy.y - from_xy.y;
+    let distance = sqrt(dx * dx + dy * dy);
+    
+    if (distance < 0.001) {
+        return false;
+    }
+    
+    let tile_size = min(map_params.tile_width, map_params.tile_height);
+    var steps = i32(ceil((distance / tile_size) * 2.0));
+    steps = clamp(steps, 2, 100);
+    
+    let step_x = dx / f32(steps);
+    let step_y = dy / f32(steps);
+    
+    for (var i = 0; i <= steps; i++) {
+        let t = f32(i) / f32(steps);
+        let x = from_xy.x + dx * t;
+        let y = from_xy.y + dy * t;
+        
+        let tile_coords = world_to_tile_coords(x, y);
+        if (is_tile_solid(tile_coords.x, tile_coords.y)) {
+            return true;
+        }
+    }
+    
+    return false;
+}
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
@@ -683,6 +752,13 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.world_pos = world_pos.xyz;
     output.normal = normalize((uniforms.model * vec4<f32>(input.normal, 0.0)).xyz);
     return output;
+}
+
+fn world_to_lightmap_uv(world_x: f32, world_y: f32) -> vec2<f32> {
+    let local_x = world_x - map_params.origin_x;
+    let u = local_x / (map_params.map_width * map_params.tile_width);
+    let v = 1.0 - (world_y / (map_params.map_height * map_params.tile_height));
+    return vec2<f32>(u, v);
 }
 
 @fragment
@@ -697,7 +773,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     
     let tex_color = textureSample(tile_texture, tile_sampler, tiled_uv).rgb;
     
-    var lighting = vec3<f32>(uniforms.ambient_light);
+    let lightmap_uv = world_to_lightmap_uv(input.world_pos.x, input.world_pos.y);
+    let baked_light = textureSample(lightmap, lightmap_sampler, lightmap_uv).r;
+    
+    var lighting = vec3<f32>(uniforms.ambient_light + baked_light);
     
     for (var i = 0; i < uniforms.num_lights; i++) {
         let light = uniforms.lights[i];
@@ -711,6 +790,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         
         let dist_norm_sq = dist_sq / radius_sq;
         if (dist_norm_sq >= 1.0) {
+            continue;
+        }
+        
+        let light_xy = vec2<f32>(light.position.x, light.position.y);
+        let frag_xy = vec2<f32>(input.world_pos.x, input.world_pos.y);
+        
+        if (is_occluded_by_tiles(light_xy, frag_xy)) {
             continue;
         }
         

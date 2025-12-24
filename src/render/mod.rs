@@ -13,6 +13,8 @@ pub mod layouts;
 pub mod debug;
 pub mod particles;
 pub mod map_meshes;
+pub mod tile_occlusion;
+pub mod lightmap;
 
 pub use wgpu_renderer::WgpuRenderer;
 pub use md3_renderer::MD3Renderer;
